@@ -87,6 +87,7 @@ router.get(
         id: true,
         name: true,
         email: true,
+        isPlatformAdmin: true,
         memberships: {
           select: {
             role: true,

@@ -39,11 +39,25 @@ async function main() {
     ],
   });
 
+  // Platform admin (for the admin panel).
+  const adminHash = await bcrypt.hash("admin1234", 10);
+  await prisma.user.create({
+    data: {
+      name: "Platform Admin",
+      email: "admin@laxora.app",
+      passwordHash: adminHash,
+      isPlatformAdmin: true,
+    },
+  });
+
   console.log("Seeded demo account:");
   console.log("  email: demo@laxora.app");
   console.log("  password: demo1234");
   console.log(`  business: ${business.name} (${business.id})`);
   console.log(`  customer: ${customer.name}`);
+  console.log("Seeded platform admin:");
+  console.log("  email: admin@laxora.app");
+  console.log("  password: admin1234");
 }
 
 main()
