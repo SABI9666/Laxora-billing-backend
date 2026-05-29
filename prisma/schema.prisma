@@ -1,0 +1,214 @@
+// Laxora Billing — Prisma schema
+// Database: Neon (serverless PostgreSQL)
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Identity & tenancy
+// ----------------------------------------------------------------------------
+
+model User {
+  id           String       @id @default(cuid())
+  email        String       @unique
+  passwordHash String
+  name         String
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  memberships  Membership[]
+  ownedBusinesses Business[] @relation("BusinessOwner")
+}
+
+model Business {
+  id        String   @id @default(cuid())
+  name      String
+  ownerId   String
+  owner     User     @relation("BusinessOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  gstin     String?
+  phone     String?
+  email     String?
+  address   String?
+  logoUrl   String?
+  // Next invoice numbers (simple auto-increment per business)
+  nextSaleNo     Int @default(1)
+  nextPurchaseNo Int @default(1)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships Membership[]
+  parties     Party[]
+  items       Item[]
+  invoices    Invoice[]
+  payments    Payment[]
+}
+
+enum Role {
+  OWNER
+  ADMIN
+  STAFF
+}
+
+model Membership {
+  id         String   @id @default(cuid())
+  userId     String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  role       Role     @default(OWNER)
+  createdAt  DateTime @default(now())
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+// ----------------------------------------------------------------------------
+// Parties (customers & suppliers)
+// ----------------------------------------------------------------------------
+
+enum PartyType {
+  CUSTOMER
+  SUPPLIER
+}
+
+model Party {
+  id             String    @id @default(cuid())
+  businessId     String
+  business       Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name           String
+  type           PartyType @default(CUSTOMER)
+  phone          String?
+  email          String?
+  gstin          String?
+  billingAddress String?
+  openingBalance Decimal   @default(0) @db.Decimal(14, 2)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  invoices Invoice[]
+  payments Payment[]
+
+  @@index([businessId])
+}
+
+// ----------------------------------------------------------------------------
+// Items (products / services + inventory)
+// ----------------------------------------------------------------------------
+
+model Item {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name          String
+  sku           String?
+  hsn           String?
+  unit          String   @default("PCS")
+  salePrice     Decimal  @default(0) @db.Decimal(14, 2)
+  purchasePrice Decimal  @default(0) @db.Decimal(14, 2)
+  taxRate       Decimal  @default(0) @db.Decimal(5, 2)
+  stockQty      Decimal  @default(0) @db.Decimal(14, 3)
+  lowStockAlert Decimal  @default(0) @db.Decimal(14, 3)
+  isService     Boolean  @default(false)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  invoiceItems InvoiceItem[]
+
+  @@index([businessId])
+}
+
+// ----------------------------------------------------------------------------
+// Invoices
+// ----------------------------------------------------------------------------
+
+enum InvoiceType {
+  SALE
+  PURCHASE
+}
+
+enum InvoiceStatus {
+  UNPAID
+  PARTIAL
+  PAID
+}
+
+model Invoice {
+  id            String        @id @default(cuid())
+  businessId    String
+  business      Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  partyId       String
+  party         Party         @relation(fields: [partyId], references: [id])
+  invoiceNumber String
+  type          InvoiceType   @default(SALE)
+  status        InvoiceStatus @default(UNPAID)
+  invoiceDate   DateTime      @default(now())
+  dueDate       DateTime?
+  subtotal      Decimal       @default(0) @db.Decimal(14, 2)
+  discount      Decimal       @default(0) @db.Decimal(14, 2)
+  taxAmount     Decimal       @default(0) @db.Decimal(14, 2)
+  total         Decimal       @default(0) @db.Decimal(14, 2)
+  amountPaid    Decimal       @default(0) @db.Decimal(14, 2)
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  items    InvoiceItem[]
+  payments Payment[]
+
+  @@unique([businessId, type, invoiceNumber])
+  @@index([businessId])
+  @@index([partyId])
+}
+
+model InvoiceItem {
+  id          String  @id @default(cuid())
+  invoiceId   String
+  invoice     Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  itemId      String?
+  item        Item?   @relation(fields: [itemId], references: [id])
+  description String
+  quantity    Decimal @default(1) @db.Decimal(14, 3)
+  rate        Decimal @default(0) @db.Decimal(14, 2)
+  taxRate     Decimal @default(0) @db.Decimal(5, 2)
+  amount      Decimal @default(0) @db.Decimal(14, 2)
+
+  @@index([invoiceId])
+}
+
+// ----------------------------------------------------------------------------
+// Payments
+// ----------------------------------------------------------------------------
+
+enum PaymentMethod {
+  CASH
+  BANK
+  UPI
+  CARD
+  CHEQUE
+  OTHER
+}
+
+model Payment {
+  id          String        @id @default(cuid())
+  businessId  String
+  business    Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  partyId     String
+  party       Party         @relation(fields: [partyId], references: [id])
+  invoiceId   String?
+  invoice     Invoice?      @relation(fields: [invoiceId], references: [id])
+  amount      Decimal       @db.Decimal(14, 2)
+  method      PaymentMethod @default(CASH)
+  paymentDate DateTime      @default(now())
+  notes       String?
+  createdAt   DateTime      @default(now())
+
+  @@index([businessId])
+  @@index([partyId])
+}
