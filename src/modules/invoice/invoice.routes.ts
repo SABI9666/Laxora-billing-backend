@@ -1,10 +1,12 @@
 import { Router } from "express";
 import { z } from "zod";
-import { Prisma } from "@prisma/client";
+import { StockMovementType } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
+import { requireRole, BILLING_ROLES } from "../../middleware/roles";
+import { recordStockMovement } from "../../lib/stock";
 
 const router = Router();
 
@@ -63,6 +65,7 @@ router.get(
 // POST /api/invoices — create invoice, compute totals, adjust stock atomically.
 router.post(
   "/",
+  requireRole(...BILLING_ROLES),
   validateBody(invoiceSchema),
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof invoiceSchema>;
@@ -125,18 +128,19 @@ router.post(
         include: { items: true, party: true },
       });
 
-      // Adjust stock: SALE reduces stock, PURCHASE increases it.
+      // Adjust stock and record the movement: SALE removes stock, PURCHASE adds.
       for (const l of lines) {
         if (!l.itemId) continue;
-        await tx.item.update({
-          where: { id: l.itemId },
-          data: {
-            stockQty: {
-              [body.type === "SALE" ? "decrement" : "increment"]: new Prisma.Decimal(
-                l.quantity
-              ),
-            },
-          },
+        const isSale = body.type === "SALE";
+        await recordStockMovement(tx, {
+          businessId,
+          itemId: l.itemId,
+          type: isSale ? StockMovementType.OUT : StockMovementType.IN,
+          quantity: isSale ? -l.quantity : l.quantity,
+          reason: isSale ? "Sale" : "Purchase",
+          reference: invoiceNumber,
+          invoiceId: created.id,
+          createdById: req.auth!.userId,
         });
       }
 
@@ -158,18 +162,22 @@ router.delete(
     if (!invoice) throw notFound("Invoice not found");
 
     await prisma.$transaction(async (tx) => {
-      // Reverse the stock movement before deleting.
+      // Reverse the stock movement (and log the reversal) before deleting.
       for (const l of invoice.items) {
         if (!l.itemId) continue;
-        await tx.item.update({
-          where: { id: l.itemId },
-          data: {
-            stockQty: {
-              [invoice.type === "SALE" ? "increment" : "decrement"]: l.quantity,
-            },
-          },
+        const wasSale = invoice.type === "SALE";
+        await recordStockMovement(tx, {
+          businessId: req.businessId!,
+          itemId: l.itemId,
+          type: wasSale ? StockMovementType.IN : StockMovementType.OUT,
+          quantity: wasSale ? Number(l.quantity) : -Number(l.quantity),
+          reason: `Reversal: deleted ${invoice.invoiceNumber}`,
+          reference: invoice.invoiceNumber,
+          createdById: req.auth!.userId,
         });
       }
+      // StockMovement rows reference invoices only by number, so they survive
+      // deletion as a historical record.
       await tx.payment.deleteMany({ where: { invoiceId: invoice.id } });
       await tx.invoice.delete({ where: { id: invoice.id } });
     });

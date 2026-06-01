@@ -16,45 +16,83 @@ datasource db {
 // ----------------------------------------------------------------------------
 
 model User {
-  id              String       @id @default(cuid())
-  email           String       @unique
+  id              String   @id @default(cuid())
+  email           String   @unique
   passwordHash    String
   name            String
-  isPlatformAdmin Boolean      @default(false)
-  createdAt       DateTime     @default(now())
-  updatedAt       DateTime     @updatedAt
+  isPlatformAdmin Boolean  @default(false)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
 
-  memberships  Membership[]
-  ownedBusinesses Business[] @relation("BusinessOwner")
+  memberships     Membership[]
+  ownedBusinesses Business[]   @relation("BusinessOwner")
+  ownedFranchises Franchise[]  @relation("FranchiseOwner")
 }
 
-model Business {
+// ----------------------------------------------------------------------------
+// Franchise — the top-level brand that owns many shops (Businesses).
+// A Business with no franchiseId is a standalone shop (backwards compatible).
+// ----------------------------------------------------------------------------
+
+model Franchise {
   id        String   @id @default(cuid())
   name      String
   ownerId   String
-  owner     User     @relation("BusinessOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  owner     User     @relation("FranchiseOwner", fields: [ownerId], references: [id], onDelete: Cascade)
   gstin     String?
   phone     String?
   email     String?
   address   String?
   logoUrl   String?
-  // Next invoice numbers (simple auto-increment per business)
-  nextSaleNo     Int @default(1)
-  nextPurchaseNo Int @default(1)
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships Membership[]
-  parties     Party[]
-  items       Item[]
-  invoices    Invoice[]
-  payments    Payment[]
+  shops Business[]
+
+  @@index([ownerId])
+}
+
+// A Business represents a single shop / branch. It may optionally belong to a
+// Franchise, which lets a franchise admin roll up data across many shops.
+model Business {
+  id             String     @id @default(cuid())
+  name           String
+  code           String? // short shop code, e.g. "MG-ROAD"
+  ownerId        String
+  owner          User       @relation("BusinessOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  franchiseId    String?
+  franchise      Franchise? @relation(fields: [franchiseId], references: [id], onDelete: SetNull)
+  isActive       Boolean    @default(true)
+  gstin          String?
+  phone          String?
+  email          String?
+  address        String?
+  logoUrl        String?
+  // Next invoice numbers (simple auto-increment per business)
+  nextSaleNo     Int        @default(1)
+  nextPurchaseNo Int        @default(1)
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  memberships    Membership[]
+  parties        Party[]
+  items          Item[]
+  invoices       Invoice[]
+  payments       Payment[]
+  categories     Category[]
+  stockMovements StockMovement[]
+
+  @@index([franchiseId])
 }
 
 enum Role {
   OWNER
   ADMIN
   STAFF
+  // Retail / franchise roles
+  FRANCHISE_ADMIN // sees all shops in the franchise; read-only monitoring + masters
+  MANAGER // manages one shop fully (a.k.a. shop admin / shop manager)
+  CASHIER // can only bill/sell at one shop (a.k.a. sales staff)
 }
 
 model Membership {
@@ -100,29 +138,56 @@ model Party {
 }
 
 // ----------------------------------------------------------------------------
+// Categories — product grouping (e.g. Bulb / Panel / Strip / Driver)
+// ----------------------------------------------------------------------------
+
+model Category {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  name       String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  items Item[]
+
+  @@unique([businessId, name])
+  @@index([businessId])
+}
+
+// ----------------------------------------------------------------------------
 // Items (products / services + inventory)
 // ----------------------------------------------------------------------------
 
 model Item {
-  id            String   @id @default(cuid())
+  id            String    @id @default(cuid())
   businessId    String
-  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business      Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  categoryId    String?
+  category      Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   name          String
   sku           String?
+  barcode       String?
+  brand         String?
+  // Retail attributes (e.g. LED wattage, model)
+  wattage       String?
   hsn           String?
-  unit          String   @default("PCS")
-  salePrice     Decimal  @default(0) @db.Decimal(14, 2)
-  purchasePrice Decimal  @default(0) @db.Decimal(14, 2)
-  taxRate       Decimal  @default(0) @db.Decimal(5, 2)
-  stockQty      Decimal  @default(0) @db.Decimal(14, 3)
-  lowStockAlert Decimal  @default(0) @db.Decimal(14, 3)
-  isService     Boolean  @default(false)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  unit          String    @default("PCS")
+  salePrice     Decimal   @default(0) @db.Decimal(14, 2) // MRP / sale price
+  purchasePrice Decimal   @default(0) @db.Decimal(14, 2)
+  taxRate       Decimal   @default(0) @db.Decimal(5, 2)
+  stockQty      Decimal   @default(0) @db.Decimal(14, 3)
+  lowStockAlert Decimal   @default(0) @db.Decimal(14, 3) // reorder level
+  isService     Boolean   @default(false)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
 
-  invoiceItems InvoiceItem[]
+  invoiceItems   InvoiceItem[]
+  stockMovements StockMovement[]
 
   @@index([businessId])
+  @@index([categoryId])
+  @@index([businessId, barcode])
 }
 
 // ----------------------------------------------------------------------------
@@ -212,4 +277,39 @@ model Payment {
 
   @@index([businessId])
   @@index([partyId])
+}
+
+// ----------------------------------------------------------------------------
+// Stock ledger — every change to on-hand quantity is recorded here so the
+// shop has a full audit trail. `stockQty` on Item is the running balance.
+// ----------------------------------------------------------------------------
+
+enum StockMovementType {
+  IN // stock-in / purchase / goods receipt
+  OUT // sale / issue
+  ADJUST // manual correction (damage, count mismatch)
+  TRANSFER_IN // received from another shop
+  TRANSFER_OUT // sent to another shop
+}
+
+model StockMovement {
+  id           String            @id @default(cuid())
+  businessId   String
+  business     Business          @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  itemId       String
+  item         Item              @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  type         StockMovementType
+  // Signed change applied to stock (+ for IN/TRANSFER_IN, - for OUT/TRANSFER_OUT,
+  // either sign for ADJUST). `balanceAfter` is the resulting on-hand quantity.
+  quantity     Decimal           @db.Decimal(14, 3)
+  balanceAfter Decimal           @db.Decimal(14, 3)
+  reason       String?
+  reference    String? // e.g. invoice number or transfer id
+  invoiceId    String?
+  createdById  String? // user who performed the movement (audit)
+  createdAt    DateTime          @default(now())
+
+  @@index([businessId])
+  @@index([itemId])
+  @@index([businessId, createdAt])
 }
