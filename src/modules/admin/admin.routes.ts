@@ -10,20 +10,23 @@ const router = Router();
 router.get(
   "/stats",
   asyncHandler(async (_req, res) => {
-    const [users, businesses, invoices, parties, salesAgg] = await Promise.all([
-      prisma.user.count(),
-      prisma.business.count(),
-      prisma.invoice.count(),
-      prisma.party.count(),
-      prisma.invoice.aggregate({
-        where: { type: "SALE" },
-        _sum: { total: true },
-      }),
-    ]);
+    const [users, businesses, franchises, invoices, parties, salesAgg] =
+      await Promise.all([
+        prisma.user.count(),
+        prisma.business.count(),
+        prisma.franchise.count(),
+        prisma.invoice.count(),
+        prisma.party.count(),
+        prisma.invoice.aggregate({
+          where: { type: "SALE" },
+          _sum: { total: true },
+        }),
+      ]);
     res.json({
       stats: {
         users,
         businesses,
+        franchises,
         invoices,
         parties,
         totalSalesVolume: Number(salesAgg._sum.total ?? 0),
@@ -43,11 +46,27 @@ router.get(
         : undefined,
       include: {
         owner: { select: { id: true, name: true, email: true } },
+        franchise: { select: { id: true, name: true } },
         _count: { select: { invoices: true, parties: true, items: true } },
       },
       orderBy: { createdAt: "desc" },
     });
     res.json({ businesses });
+  })
+);
+
+// GET /api/admin/franchises — every franchise with owner + shop count.
+router.get(
+  "/franchises",
+  asyncHandler(async (_req, res) => {
+    const franchises = await prisma.franchise.findMany({
+      include: {
+        owner: { select: { id: true, name: true, email: true } },
+        _count: { select: { shops: true } },
+      },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ franchises });
   })
 );
 
