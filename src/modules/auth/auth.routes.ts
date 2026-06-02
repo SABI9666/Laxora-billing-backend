@@ -91,8 +91,20 @@ router.get(
         memberships: {
           select: {
             role: true,
-            business: { select: { id: true, name: true } },
+            business: {
+              select: {
+                id: true,
+                name: true,
+                code: true,
+                franchiseId: true,
+                franchise: { select: { id: true, name: true } },
+              },
+            },
           },
+        },
+        ownedFranchises: {
+          select: { id: true, name: true },
+          orderBy: { createdAt: "asc" },
         },
       },
     });
