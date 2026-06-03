@@ -237,6 +237,41 @@ router.get(
     const salesNet = Number(sales._sum.subtotal ?? 0) - Number(sales._sum.discount ?? 0);
     const grossProfit = salesNet - cogs;
 
+    // Monthly profit/loss: revenue (net) and COGS per month.
+    const monthlyRows = await prisma.$queryRaw<
+      Array<{ month: string; salesnet: number; cogs: number }>
+    >(Prisma.sql`
+      SELECT to_char(date_trunc('month', inv."invoiceDate"), 'YYYY-MM') AS month,
+             COALESCE(SUM(inv.subtotal - inv.discount), 0)::float AS salesnet,
+             COALESCE(SUM(c.cost), 0)::float AS cogs
+      FROM "Invoice" inv
+      LEFT JOIN LATERAL (
+        SELECT SUM(ii.quantity * i."purchasePrice") AS cost
+        FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
+        WHERE ii."invoiceId" = inv.id
+      ) c ON true
+      WHERE ${Prisma.join(conditions, " AND ")}
+      GROUP BY 1 ORDER BY 1
+    `);
+
+    // Per-bill profit/loss (most recent 100 sales).
+    const billRows = await prisma.$queryRaw<
+      Array<{ number: string; date: Date; revenue: number; cogs: number }>
+    >(Prisma.sql`
+      SELECT inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
+             (inv.subtotal - inv.discount)::float AS revenue,
+             COALESCE(c.cost, 0)::float AS cogs
+      FROM "Invoice" inv
+      LEFT JOIN LATERAL (
+        SELECT SUM(ii.quantity * i."purchasePrice") AS cost
+        FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
+        WHERE ii."invoiceId" = inv.id
+      ) c ON true
+      WHERE ${Prisma.join(conditions, " AND ")}
+      ORDER BY inv."invoiceDate" DESC, inv."invoiceNumber" DESC
+      LIMIT 100
+    `);
+
     res.json({
       shop: business.name,
       period: { from: from ?? null, to: to ?? null },
@@ -252,6 +287,22 @@ router.get(
         salesCount: sales._count,
         purchaseCount: purchases._count,
       },
+      monthly: monthlyRows.map((m) => {
+        const sNet = round2(Number(m.salesnet));
+        const c = round2(Number(m.cogs));
+        return { month: m.month, salesNet: sNet, cogs: c, profit: round2(sNet - c) };
+      }),
+      bills: billRows.map((b) => {
+        const rev = round2(Number(b.revenue));
+        const c = round2(Number(b.cogs));
+        return {
+          number: b.number,
+          date: b.date,
+          revenue: rev,
+          cogs: c,
+          profit: round2(rev - c),
+        };
+      }),
     });
   })
 );
