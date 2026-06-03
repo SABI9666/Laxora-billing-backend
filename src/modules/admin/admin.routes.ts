@@ -1,8 +1,11 @@
 import { Router } from "express";
+import { z } from "zod";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
-import { notFound } from "../../utils/errors";
+import { validateBody } from "../../middleware/validate";
+import { badRequest, conflict, notFound } from "../../utils/errors";
+import { hashPassword } from "../../utils/password";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
 const router = Router();
@@ -408,6 +411,102 @@ router.get(
       closingBalance: round2(balance),
       ledger,
     });
+  })
+);
+
+// ---- Shop logins: one login per shop (created by the platform admin) -------
+
+const shopLoginSchema = z.object({
+  name: z.string().min(1),
+  username: z
+    .string()
+    .min(3)
+    .regex(/^[a-zA-Z0-9._-]+$/, "Use letters, numbers, dot, underscore or dash only"),
+  password: z.string().min(6),
+});
+
+// GET /api/admin/businesses/:id/logins — the logins that can access this shop.
+router.get(
+  "/businesses/:id/logins",
+  asyncHandler(async (req, res) => {
+    const memberships = await prisma.membership.findMany({
+      where: { businessId: req.params.id },
+      include: { user: { select: { id: true, name: true, username: true, email: true } } },
+      orderBy: { createdAt: "asc" },
+    });
+    res.json({
+      logins: memberships.map((m) => ({
+        userId: m.user.id,
+        name: m.user.name,
+        username: m.user.username,
+        email: m.user.email,
+        role: m.role,
+      })),
+    });
+  })
+);
+
+// POST /api/admin/businesses/:id/login — create ONE login for this shop. The
+// account can manage only this shop (role MANAGER).
+router.post(
+  "/businesses/:id/login",
+  validateBody(shopLoginSchema),
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const business = await prisma.business.findUnique({ where: { id } });
+    if (!business) throw notFound("Shop not found");
+
+    const username = String(req.body.username).toLowerCase();
+    const syntheticEmail = `${username}@shop.laxora`;
+    const existing = await prisma.user.findFirst({
+      where: { OR: [{ username }, { email: syntheticEmail }, { email: username }] },
+    });
+    if (existing) throw conflict("That username is already taken");
+
+    const passwordHash = await hashPassword(req.body.password);
+    const user = await prisma.$transaction(async (tx) => {
+      const u = await tx.user.create({
+        data: { name: req.body.name, username, email: syntheticEmail, passwordHash },
+      });
+      await tx.membership.create({
+        data: { userId: u.id, businessId: id, role: "MANAGER" },
+      });
+      return u;
+    });
+
+    res.status(201).json({
+      login: { userId: user.id, name: user.name, username: user.username },
+    });
+  })
+);
+
+// POST /api/admin/logins/:userId/password — reset a shop login's password.
+router.post(
+  "/logins/:userId/password",
+  validateBody(z.object({ password: z.string().min(6) })),
+  asyncHandler(async (req, res) => {
+    const user = await prisma.user.findUnique({ where: { id: req.params.userId } });
+    if (!user) throw notFound("Login not found");
+    await prisma.user.update({
+      where: { id: user.id },
+      data: { passwordHash: await hashPassword(req.body.password) },
+    });
+    res.json({ ok: true });
+  })
+);
+
+// DELETE /api/admin/logins/:userId — remove a shop login.
+router.delete(
+  "/logins/:userId",
+  asyncHandler(async (req, res) => {
+    const user = await prisma.user.findUnique({
+      where: { id: req.params.userId },
+      select: { isPlatformAdmin: true },
+    });
+    if (!user) throw notFound("Login not found");
+    if (user.isPlatformAdmin) throw badRequest("Cannot delete a platform admin here");
+    await prisma.user.delete({ where: { id: req.params.userId } });
+    res.status(204).send();
   })
 );
 
