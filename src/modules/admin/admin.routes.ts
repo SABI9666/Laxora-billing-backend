@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { notFound } from "../../utils/errors";
@@ -67,6 +68,91 @@ router.get(
       orderBy: { createdAt: "desc" },
     });
     res.json({ franchises });
+  })
+);
+
+// GET /api/admin/businesses/:id/details — full detail for one shop, so the
+// platform admin can select a shop and see everything about it.
+router.get(
+  "/businesses/:id/details",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const business = await prisma.business.findUnique({
+      where: { id },
+      include: {
+        owner: { select: { id: true, name: true, email: true } },
+        franchise: { select: { id: true, name: true } },
+      },
+    });
+    if (!business) throw notFound("Shop not found");
+
+    const [salesAgg, purchaseAgg, receivableInvoices, partyCount, itemCount, recentInvoices, lowStock, stockValue] =
+      await Promise.all([
+        prisma.invoice.aggregate({
+          where: { businessId: id, type: "SALE" },
+          _sum: { total: true },
+          _count: true,
+        }),
+        prisma.invoice.aggregate({
+          where: { businessId: id, type: "PURCHASE" },
+          _sum: { total: true },
+          _count: true,
+        }),
+        prisma.invoice.findMany({
+          where: { businessId: id, type: "SALE", status: { in: ["UNPAID", "PARTIAL"] } },
+          select: { total: true, amountPaid: true },
+        }),
+        prisma.party.count({ where: { businessId: id } }),
+        prisma.item.count({ where: { businessId: id } }),
+        prisma.invoice.findMany({
+          where: { businessId: id },
+          include: { party: { select: { name: true } } },
+          orderBy: { createdAt: "desc" },
+          take: 10,
+        }),
+        prisma.$queryRaw<Array<Record<string, unknown>>>(
+          Prisma.sql`SELECT id, name, sku, unit, "stockQty", "lowStockAlert"
+                     FROM "Item"
+                     WHERE "businessId" = ${id} AND "isService" = false
+                     AND "stockQty" <= "lowStockAlert"
+                     ORDER BY "stockQty" ASC`
+        ),
+        prisma.$queryRaw<Array<{ value: number }>>(
+          Prisma.sql`SELECT COALESCE(SUM("stockQty" * "purchasePrice"), 0)::float AS value
+                     FROM "Item" WHERE "businessId" = ${id} AND "isService" = false`
+        ),
+      ]);
+
+    const totalReceivable = receivableInvoices.reduce(
+      (s, i) => s + (Number(i.total) - Number(i.amountPaid)),
+      0
+    );
+
+    res.json({
+      business: {
+        id: business.id,
+        name: business.name,
+        code: business.code,
+        gstin: business.gstin,
+        phone: business.phone,
+        address: business.address,
+        owner: business.owner,
+        franchise: business.franchise,
+      },
+      kpis: {
+        totalSales: Number(salesAgg._sum.total ?? 0),
+        salesCount: salesAgg._count,
+        totalPurchases: Number(purchaseAgg._sum.total ?? 0),
+        purchaseCount: purchaseAgg._count,
+        totalReceivable: Math.round(totalReceivable * 100) / 100,
+        partyCount,
+        itemCount,
+        lowStockCount: lowStock.length,
+        stockValue: Math.round(Number(stockValue[0]?.value ?? 0) * 100) / 100,
+      },
+      recentInvoices,
+      lowStockItems: lowStock,
+    });
   })
 );
 
