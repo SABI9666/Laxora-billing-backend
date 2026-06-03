@@ -17,8 +17,9 @@ const registerSchema = z.object({
   businessName: z.string().min(1),
 });
 
+// `email` here may be an email address OR a shop-login username.
 const loginSchema = z.object({
-  email: z.string().email(),
+  email: z.string().min(1),
   password: z.string().min(1),
 });
 
@@ -62,8 +63,12 @@ router.post(
   validateBody(loginSchema),
   asyncHandler(async (req, res) => {
     const { email, password } = req.body;
-    const user = await prisma.user.findUnique({ where: { email } });
-    if (!user) throw unauthorized("Invalid email or password");
+    // Accept either an email address or a username as the login id.
+    const id = String(email).trim();
+    const user = await prisma.user.findFirst({
+      where: { OR: [{ email: id }, { username: id }] },
+    });
+    if (!user) throw unauthorized("Invalid login or password");
 
     const ok = await verifyPassword(password, user.passwordHash);
     if (!ok) throw unauthorized("Invalid email or password");

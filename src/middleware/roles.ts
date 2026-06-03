@@ -13,9 +13,14 @@ export function requireRole(...roles: Role[]) {
   };
 }
 
-// Roles allowed to manage shop masters/stock (everything except read-only
-// franchise admins and billing-only cashiers).
-export const SHOP_MANAGERS: Role[] = [Role.OWNER, Role.ADMIN, Role.MANAGER];
+// Roles allowed to manage shop masters/stock. FRANCHISE_ADMIN (the owner)
+// has full control; CASHIER/STAFF are billing-only.
+export const SHOP_MANAGERS: Role[] = [
+  Role.OWNER,
+  Role.ADMIN,
+  Role.MANAGER,
+  Role.FRANCHISE_ADMIN,
+];
 
 // Roles allowed to create sales/bills at a shop.
 export const BILLING_ROLES: Role[] = [
@@ -24,4 +29,5 @@ export const BILLING_ROLES: Role[] = [
   Role.MANAGER,
   Role.CASHIER,
   Role.STAFF,
+  Role.FRANCHISE_ADMIN,
 ];
