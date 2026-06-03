@@ -6,6 +6,8 @@ import { validateBody } from "../../middleware/validate";
 import { authenticate } from "../../middleware/auth";
 import { hashPassword, verifyPassword } from "../../utils/password";
 import { signToken } from "../../utils/jwt";
+import { sendEmail } from "../../utils/email";
+import { env } from "../../config/env";
 import { conflict, notFound, unauthorized } from "../../utils/errors";
 
 const router = Router();
@@ -78,6 +80,37 @@ router.post(
       token,
       user: { id: user.id, name: user.name, email: user.email },
     });
+  })
+);
+
+// POST /api/auth/forgot-password — a shop requests a reset; we email the admin
+// (pradeeksha) so they can reset the password in the admin panel. Always
+// returns ok so we don't reveal whether an account exists.
+router.post(
+  "/forgot-password",
+  validateBody(z.object({ email: z.string().min(1) })),
+  asyncHandler(async (req, res) => {
+    const id = String(req.body.email).trim();
+    const user = await prisma.user.findFirst({
+      where: { OR: [{ email: id }, { username: id }] },
+      include: { memberships: { include: { business: { select: { name: true } } } } },
+    });
+    if (user) {
+      const shop = user.memberships[0]?.business?.name ?? "—";
+      await sendEmail({
+        to: env.adminNotifyEmail,
+        subject: `Password reset request: ${user.username ?? user.email}`,
+        html: `
+          <p>A password reset was requested for a Laxora shop login.</p>
+          <ul>
+            <li><b>Name:</b> ${user.name}</li>
+            <li><b>Login (username):</b> ${user.username ?? user.email}</li>
+            <li><b>Shop:</b> ${shop}</li>
+          </ul>
+          <p>Reset it in <b>Admin → Shop Logins → Reset PW</b>, then share the new password with the shop.</p>`,
+      });
+    }
+    res.json({ ok: true });
   })
 );
 

@@ -20,4 +20,9 @@ export const env = {
     .split(",")
     .map((o) => o.trim())
     .filter(Boolean),
+  // Email (Resend) for password-reset notifications. Optional — if the API key
+  // is missing, email sending is skipped (no crash).
+  resendApiKey: process.env.RESEND_API_KEY ?? "",
+  emailFrom: process.env.EMAIL_FROM ?? "Laxora <onboarding@resend.dev>",
+  adminNotifyEmail: process.env.ADMIN_NOTIFY_EMAIL ?? "pradeeksha798@gmail.com",
 };
