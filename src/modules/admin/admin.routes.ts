@@ -72,6 +72,26 @@ router.get(
   })
 );
 
+// POST /api/admin/businesses — create a new shop (owned by the platform admin).
+router.post(
+  "/businesses",
+  validateBody(
+    z.object({
+      name: z.string().min(1),
+      code: z.string().optional(),
+      gstin: z.string().optional(),
+      phone: z.string().optional(),
+      address: z.string().optional(),
+    })
+  ),
+  asyncHandler(async (req, res) => {
+    const business = await prisma.business.create({
+      data: { ...req.body, ownerId: req.auth!.userId },
+    });
+    res.status(201).json({ business });
+  })
+);
+
 // GET /api/admin/franchises — every franchise with owner + shop count.
 router.get(
   "/franchises",
