@@ -208,7 +208,7 @@ router.get(
     const [sales, purchases] = await Promise.all([
       prisma.invoice.aggregate({
         where: { businessId: id, type: "SALE", ...filter },
-        _sum: { total: true, subtotal: true, discount: true, taxAmount: true },
+        _sum: { total: true, amountPaid: true, taxAmount: true },
         _count: true,
       }),
       prisma.invoice.aggregate({
@@ -218,13 +218,23 @@ router.get(
       }),
     ]);
 
-    // Cost of goods sold = quantity * purchase price for items sold.
+    // P&L is on a CASH basis: revenue = what was actually collected
+    // (amountPaid), so it updates as payments are recorded and reflects the
+    // final settled amount. Tax inside the collected amount is excluded, and
+    // cost of goods sold (qty * purchase price) is subtracted.
     const conditions = [
       Prisma.sql`inv."businessId" = ${id}`,
       Prisma.sql`inv.type = 'SALE'`,
     ];
     if (from) conditions.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
     if (to) conditions.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
+
+    // Tax actually collected = tax share of the paid portion of each bill.
+    const taxRealizedRows = await prisma.$queryRaw<Array<{ tax: number }>>(Prisma.sql`
+      SELECT COALESCE(SUM(inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0)), 0)::float AS tax
+      FROM "Invoice" inv
+      WHERE ${Prisma.join(conditions, " AND ")}
+    `);
     const cogsRows = await prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
       SELECT COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
       FROM "InvoiceItem" ii
@@ -234,15 +244,20 @@ router.get(
     `);
     const cogs = Number(cogsRows[0]?.cogs ?? 0);
 
-    const salesNet = Number(sales._sum.subtotal ?? 0) - Number(sales._sum.discount ?? 0);
-    const grossProfit = salesNet - cogs;
+    const salesGross = Number(sales._sum.total ?? 0); // total billed
+    const amountCollected = Number(sales._sum.amountPaid ?? 0); // actually received
+    const taxCollected = Number(taxRealizedRows[0]?.tax ?? 0);
+    const netRevenue = amountCollected - taxCollected; // realised sales, ex-tax
+    const grossProfit = netRevenue - cogs;
+    const outstanding = salesGross - amountCollected; // still to be received
 
-    // Monthly profit/loss: revenue (net) and COGS per month.
+    // Monthly profit/loss, also on a cash basis.
     const monthlyRows = await prisma.$queryRaw<
-      Array<{ month: string; salesnet: number; cogs: number }>
+      Array<{ month: string; collected: number; taxrealized: number; cogs: number }>
     >(Prisma.sql`
       SELECT to_char(date_trunc('month', inv."invoiceDate"), 'YYYY-MM') AS month,
-             COALESCE(SUM(inv.subtotal - inv.discount), 0)::float AS salesnet,
+             COALESCE(SUM(inv."amountPaid"), 0)::float AS collected,
+             COALESCE(SUM(inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
              COALESCE(SUM(c.cost), 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -254,12 +269,13 @@ router.get(
       GROUP BY 1 ORDER BY 1
     `);
 
-    // Per-bill profit/loss (most recent 100 sales).
+    // Per-bill profit/loss (most recent 100 sales), based on amount collected.
     const billRows = await prisma.$queryRaw<
-      Array<{ number: string; date: Date; revenue: number; cogs: number }>
+      Array<{ number: string; date: Date; collected: number; taxrealized: number; cogs: number }>
     >(Prisma.sql`
       SELECT inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
-             (inv.subtotal - inv.discount)::float AS revenue,
+             inv."amountPaid"::float AS collected,
+             (inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -276,24 +292,26 @@ router.get(
       shop: business.name,
       period: { from: from ?? null, to: to ?? null },
       pnl: {
-        salesGross: round2(Number(sales._sum.total ?? 0)),
-        salesNet: round2(salesNet),
+        salesGross: round2(salesGross),
+        amountCollected: round2(amountCollected),
+        outstanding: round2(outstanding),
+        salesNet: round2(netRevenue),
         cogs: round2(cogs),
         grossProfit: round2(grossProfit),
-        grossMarginPct: salesNet ? round2((grossProfit / salesNet) * 100) : 0,
-        taxCollected: round2(Number(sales._sum.taxAmount ?? 0)),
+        grossMarginPct: netRevenue ? round2((grossProfit / netRevenue) * 100) : 0,
+        taxCollected: round2(taxCollected),
         purchases: round2(Number(purchases._sum.total ?? 0)),
         taxPaid: round2(Number(purchases._sum.taxAmount ?? 0)),
         salesCount: sales._count,
         purchaseCount: purchases._count,
       },
       monthly: monthlyRows.map((m) => {
-        const sNet = round2(Number(m.salesnet));
+        const net = round2(Number(m.collected) - Number(m.taxrealized));
         const c = round2(Number(m.cogs));
-        return { month: m.month, salesNet: sNet, cogs: c, profit: round2(sNet - c) };
+        return { month: m.month, salesNet: net, cogs: c, profit: round2(net - c) };
       }),
       bills: billRows.map((b) => {
-        const rev = round2(Number(b.revenue));
+        const rev = round2(Number(b.collected) - Number(b.taxrealized));
         const c = round2(Number(b.cogs));
         return {
           number: b.number,
