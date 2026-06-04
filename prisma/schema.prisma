@@ -82,6 +82,7 @@ model Business {
   payments       Payment[]
   categories     Category[]
   stockMovements StockMovement[]
+  expenses       Expense[]
 
   @@index([franchiseId])
 }
@@ -313,4 +314,29 @@ model StockMovement {
   @@index([businessId])
   @@index([itemId])
   @@index([businessId, createdAt])
+}
+
+// ----------------------------------------------------------------------------
+// Expenses / charges — money spent against the business or a specific bill
+// (electrician commission, damaged/returned material, transport, etc.). These
+// are subtracted in the Profit & Loss report to give true net profit.
+// ----------------------------------------------------------------------------
+
+model Expense {
+  id          String   @id @default(cuid())
+  businessId  String
+  business    Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  // Optional link to the bill this charge relates to (kept as plain id so the
+  // expense survives if the invoice is later deleted).
+  invoiceId   String?
+  category    String // e.g. Commission, Electrician, Damage, Return, Transport, Other
+  amount      Decimal  @db.Decimal(14, 2)
+  note        String?
+  date        DateTime @default(now())
+  createdById String?
+  createdAt   DateTime @default(now())
+
+  @@index([businessId])
+  @@index([businessId, date])
+  @@index([invoiceId])
 }

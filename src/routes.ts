@@ -11,6 +11,7 @@ import categoryRoutes from "./modules/category/category.routes";
 import stockRoutes from "./modules/stock/stock.routes";
 import invoiceRoutes from "./modules/invoice/invoice.routes";
 import paymentRoutes from "./modules/payment/payment.routes";
+import expenseRoutes from "./modules/expense/expense.routes";
 import dashboardRoutes from "./modules/dashboard/dashboard.routes";
 import franchiseRoutes from "./modules/franchise/franchise.routes";
 
@@ -34,6 +35,7 @@ api.use("/categories", categoryRoutes);
 api.use("/stock", stockRoutes);
 api.use("/invoices", invoiceRoutes);
 api.use("/payments", paymentRoutes);
+api.use("/expenses", expenseRoutes);
 api.use("/dashboard", dashboardRoutes);
 
 export default api;

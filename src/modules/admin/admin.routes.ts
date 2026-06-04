@@ -251,7 +251,27 @@ router.get(
     const grossProfit = netRevenue - cogs;
     const outstanding = salesGross - amountCollected; // still to be received
 
-    // Monthly profit/loss, also on a cash basis.
+    // Expenses / charges (commission, damage, returns, etc.) reduce profit.
+    const expConditions = [Prisma.sql`"businessId" = ${id}`];
+    if (from) expConditions.push(Prisma.sql`date >= ${from}`);
+    if (to) expConditions.push(Prisma.sql`date <= ${to}`);
+    const [expTotalRows, monthlyExpRows] = await Promise.all([
+      prisma.$queryRaw<Array<{ total: number }>>(Prisma.sql`
+        SELECT COALESCE(SUM(amount), 0)::float AS total FROM "Expense"
+        WHERE ${Prisma.join(expConditions, " AND ")}
+      `),
+      prisma.$queryRaw<Array<{ month: string; exp: number }>>(Prisma.sql`
+        SELECT to_char(date_trunc('month', date), 'YYYY-MM') AS month,
+               COALESCE(SUM(amount), 0)::float AS exp
+        FROM "Expense" WHERE ${Prisma.join(expConditions, " AND ")}
+        GROUP BY 1
+      `),
+    ]);
+    const totalExpenses = Number(expTotalRows[0]?.total ?? 0);
+    const netProfit = grossProfit - totalExpenses;
+    const expByMonth = new Map(monthlyExpRows.map((r) => [r.month, Number(r.exp)]));
+
+    // Monthly profit/loss, cash basis, net of expenses.
     const monthlyRows = await prisma.$queryRaw<
       Array<{ month: string; collected: number; taxrealized: number; cogs: number }>
     >(Prisma.sql`
@@ -266,23 +286,57 @@ router.get(
         WHERE ii."invoiceId" = inv.id
       ) c ON true
       WHERE ${Prisma.join(conditions, " AND ")}
-      GROUP BY 1 ORDER BY 1
+      GROUP BY 1
     `);
 
-    // Per-bill profit/loss (most recent 100 sales), based on amount collected.
+    // Merge sales-derived months with expense-only months.
+    const salesByMonth = new Map<string, { net: number; cogs: number }>();
+    for (const m of monthlyRows) {
+      salesByMonth.set(m.month, {
+        net: Number(m.collected) - Number(m.taxrealized),
+        cogs: Number(m.cogs),
+      });
+    }
+    const allMonths = new Set<string>([...salesByMonth.keys(), ...expByMonth.keys()]);
+    const monthly = Array.from(allMonths)
+      .sort()
+      .map((month) => {
+        const s = salesByMonth.get(month) ?? { net: 0, cogs: 0 };
+        const exp = expByMonth.get(month) ?? 0;
+        return {
+          month,
+          salesNet: round2(s.net),
+          cogs: round2(s.cogs),
+          expenses: round2(exp),
+          profit: round2(s.net - s.cogs - exp),
+        };
+      });
+
+    // Per-bill profit/loss (most recent 100 sales) incl. charges on that bill.
     const billRows = await prisma.$queryRaw<
-      Array<{ number: string; date: Date; collected: number; taxrealized: number; cogs: number }>
+      Array<{
+        number: string;
+        date: Date;
+        collected: number;
+        taxrealized: number;
+        cogs: number;
+        expense: number;
+      }>
     >(Prisma.sql`
       SELECT inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
              inv."amountPaid"::float AS collected,
              (inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0))::float AS taxrealized,
-             COALESCE(c.cost, 0)::float AS cogs
+             COALESCE(c.cost, 0)::float AS cogs,
+             COALESCE(e.exp, 0)::float AS expense
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
         SELECT SUM(ii.quantity * i."purchasePrice") AS cost
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = inv.id
       ) c ON true
+      LEFT JOIN LATERAL (
+        SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
+      ) e ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       ORDER BY inv."invoiceDate" DESC, inv."invoiceNumber" DESC
       LIMIT 100
@@ -299,26 +353,27 @@ router.get(
         cogs: round2(cogs),
         grossProfit: round2(grossProfit),
         grossMarginPct: netRevenue ? round2((grossProfit / netRevenue) * 100) : 0,
+        expenses: round2(totalExpenses),
+        netProfit: round2(netProfit),
+        netMarginPct: netRevenue ? round2((netProfit / netRevenue) * 100) : 0,
         taxCollected: round2(taxCollected),
         purchases: round2(Number(purchases._sum.total ?? 0)),
         taxPaid: round2(Number(purchases._sum.taxAmount ?? 0)),
         salesCount: sales._count,
         purchaseCount: purchases._count,
       },
-      monthly: monthlyRows.map((m) => {
-        const net = round2(Number(m.collected) - Number(m.taxrealized));
-        const c = round2(Number(m.cogs));
-        return { month: m.month, salesNet: net, cogs: c, profit: round2(net - c) };
-      }),
+      monthly,
       bills: billRows.map((b) => {
         const rev = round2(Number(b.collected) - Number(b.taxrealized));
         const c = round2(Number(b.cogs));
+        const exp = round2(Number(b.expense));
         return {
           number: b.number,
           date: b.date,
           revenue: rev,
           cogs: c,
-          profit: round2(rev - c),
+          expense: exp,
+          profit: round2(rev - c - exp),
         };
       }),
     });
