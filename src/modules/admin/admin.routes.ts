@@ -315,6 +315,7 @@ router.get(
     // Per-bill profit/loss (most recent 100 sales) incl. charges on that bill.
     const billRows = await prisma.$queryRaw<
       Array<{
+        id: string;
         number: string;
         date: Date;
         collected: number;
@@ -323,7 +324,7 @@ router.get(
         expense: number;
       }>
     >(Prisma.sql`
-      SELECT inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
+      SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
              inv."amountPaid"::float AS collected,
              (inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs,
@@ -368,6 +369,7 @@ router.get(
         const c = round2(Number(b.cogs));
         const exp = round2(Number(b.expense));
         return {
+          id: b.id,
           number: b.number,
           date: b.date,
           revenue: rev,
@@ -376,6 +378,76 @@ router.get(
           profit: round2(rev - c - exp),
         };
       }),
+    });
+  })
+);
+
+// GET /api/admin/invoices/:invoiceId/pnl — full P&L breakdown for ONE bill.
+router.get(
+  "/invoices/:invoiceId/pnl",
+  asyncHandler(async (req, res) => {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: req.params.invoiceId },
+      include: {
+        items: true,
+        party: { select: { name: true } },
+        business: { select: { name: true } },
+      },
+    });
+    if (!invoice) throw notFound("Bill not found");
+
+    const [cogsRows, chargeGroups] = await Promise.all([
+      prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
+        SELECT COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
+        FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
+        WHERE ii."invoiceId" = ${invoice.id}
+      `),
+      prisma.expense.groupBy({
+        by: ["category"],
+        where: { invoiceId: invoice.id },
+        _sum: { amount: true },
+      }),
+    ]);
+
+    const cogs = Number(cogsRows[0]?.cogs ?? 0);
+    const charges = chargeGroups.map((g) => ({
+      category: g.category,
+      amount: round2(Number(g._sum.amount ?? 0)),
+    }));
+    const chargesTotal = charges.reduce((s, c) => s + c.amount, 0);
+
+    const subtotal = Number(invoice.subtotal);
+    const discount = Number(invoice.discount);
+    const gst = Number(invoice.taxAmount);
+    const total = Number(invoice.total);
+    const netSale = subtotal - discount; // ex-GST sale value
+    const grossProfit = netSale - cogs;
+    const netProfit = grossProfit - chargesTotal;
+
+    res.json({
+      bill: {
+        id: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        date: invoice.invoiceDate,
+        party: invoice.party?.name ?? "—",
+        shop: invoice.business?.name ?? "—",
+        status: invoice.status,
+      },
+      statement: {
+        subtotal: round2(subtotal),
+        discount: round2(discount),
+        netSale: round2(netSale),
+        gst: round2(gst),
+        totalBilled: round2(total), // incl GST
+        amountCollected: round2(Number(invoice.amountPaid)),
+        outstanding: round2(total - Number(invoice.amountPaid)),
+        cogs: round2(cogs),
+        grossProfit: round2(grossProfit),
+        charges,
+        chargesTotal: round2(chargesTotal),
+        netProfit: round2(netProfit),
+        netMarginPct: netSale ? round2((netProfit / netSale) * 100) : 0,
+      },
     });
   })
 );
