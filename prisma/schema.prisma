@@ -83,6 +83,7 @@ model Business {
   categories     Category[]
   stockMovements StockMovement[]
   expenses       Expense[]
+  creditNotes    CreditNote[]
 
   @@index([franchiseId])
 }
@@ -339,4 +340,32 @@ model Expense {
   @@index([businessId])
   @@index([businessId, date])
   @@index([invoiceId])
+}
+
+// ----------------------------------------------------------------------------
+// Credit notes — sales returns. They keep the original bill intact, put stock
+// back, show as a credit in the customer ledger, and reduce revenue/COGS in
+// the P&L (so profit drops by the lost margin, not the whole amount).
+// ----------------------------------------------------------------------------
+
+model CreditNote {
+  id            String   @id @default(cuid())
+  businessId    String
+  business      Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  partyId       String?
+  invoiceId     String?
+  invoiceNumber String?
+  date          DateTime @default(now())
+  netAmount     Decimal  @db.Decimal(14, 2) // ex-tax value returned
+  taxAmount     Decimal  @db.Decimal(14, 2)
+  totalAmount   Decimal  @db.Decimal(14, 2) // incl tax (what reduces receivable)
+  cogs          Decimal  @db.Decimal(14, 2) // cost of returned goods
+  reason        String?
+  createdById   String?
+  createdAt     DateTime @default(now())
+
+  @@index([businessId])
+  @@index([partyId])
+  @@index([invoiceId])
+  @@index([businessId, date])
 }

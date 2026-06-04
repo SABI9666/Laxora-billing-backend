@@ -186,9 +186,10 @@ router.delete(
   })
 );
 
-// POST /api/invoices/:id/return — record a sales return against a bill:
-// puts the returned items back into stock and reduces the bill's revenue,
-// tax, total and paid amount (refund). Profit reflects it automatically.
+// POST /api/invoices/:id/return — record a sales return as a CREDIT NOTE:
+// puts the returned items back into stock, records a credit note (which shows
+// in the customer ledger as a credit and reduces P&L revenue/COGS). The
+// original bill is kept intact for history.
 const returnSchema = z.object({
   reason: z.string().optional(),
   items: z
@@ -213,13 +214,7 @@ router.post(
 
     let returnNet = 0;
     let returnTax = 0;
-    const updates: {
-      id: string;
-      newQty: number;
-      newAmount: number;
-      itemId: string | null;
-      retQty: number;
-    }[] = [];
+    const returned: { itemId: string | null; retQty: number }[] = [];
     for (const li of invoice.items) {
       const reqQty = reqMap.get(li.id);
       if (!reqQty) continue;
@@ -228,56 +223,57 @@ router.post(
       const lineNet = retQty * Number(li.rate);
       returnNet += lineNet;
       returnTax += (lineNet * Number(li.taxRate)) / 100;
-      updates.push({
-        id: li.id,
-        newQty: Number(li.quantity) - retQty,
-        newAmount: (Number(li.quantity) - retQty) * Number(li.rate),
-        itemId: li.itemId,
-        retQty,
-      });
+      returned.push({ itemId: li.itemId, retQty });
     }
-    if (updates.length === 0) throw badRequest("Nothing to return on this bill");
+    if (returned.length === 0) throw badRequest("Nothing to return on this bill");
+
+    // Cost of the returned goods (for COGS reduction in P&L).
+    const itemIds = returned.map((r) => r.itemId).filter(Boolean) as string[];
+    const itemRows = itemIds.length
+      ? await prisma.item.findMany({
+          where: { id: { in: itemIds } },
+          select: { id: true, purchasePrice: true },
+        })
+      : [];
+    const priceMap = new Map(itemRows.map((i) => [i.id, Number(i.purchasePrice)]));
+    const returnCogs = returned.reduce(
+      (s, r) => s + (r.itemId ? r.retQty * (priceMap.get(r.itemId) ?? 0) : 0),
+      0
+    );
 
     const returnGross = round2(returnNet + returnTax);
 
-    const updated = await prisma.$transaction(async (tx) => {
-      for (const u of updates) {
-        await tx.invoiceItem.update({
-          where: { id: u.id },
-          data: { quantity: round2(u.newQty), amount: round2(u.newAmount) },
+    const creditNote = await prisma.$transaction(async (tx) => {
+      for (const r of returned) {
+        if (!r.itemId) continue;
+        await recordStockMovement(tx, {
+          businessId,
+          itemId: r.itemId,
+          type: StockMovementType.IN,
+          quantity: r.retQty,
+          reason: `Sales return${body.reason ? ` - ${body.reason}` : ""}`,
+          reference: invoice.invoiceNumber,
+          invoiceId: invoice.id,
+          createdById: req.auth!.userId,
         });
-        if (u.itemId) {
-          await recordStockMovement(tx, {
-            businessId,
-            itemId: u.itemId,
-            type: StockMovementType.IN,
-            quantity: u.retQty,
-            reason: `Sales return${body.reason ? ` - ${body.reason}` : ""}`,
-            reference: invoice.invoiceNumber,
-            invoiceId: invoice.id,
-            createdById: req.auth!.userId,
-          });
-        }
       }
-      const newTotal = round2(Number(invoice.total) - returnGross);
-      const refund = Math.min(Number(invoice.amountPaid), returnGross);
-      const newPaid = round2(Number(invoice.amountPaid) - refund);
-      const status: "UNPAID" | "PARTIAL" | "PAID" =
-        newPaid <= 0 ? "UNPAID" : newPaid >= newTotal ? "PAID" : "PARTIAL";
-      return tx.invoice.update({
-        where: { id: invoice.id },
+      return tx.creditNote.create({
         data: {
-          subtotal: round2(Number(invoice.subtotal) - returnNet),
-          taxAmount: round2(Number(invoice.taxAmount) - returnTax),
-          total: newTotal,
-          amountPaid: newPaid,
-          status,
+          businessId,
+          partyId: invoice.partyId,
+          invoiceId: invoice.id,
+          invoiceNumber: invoice.invoiceNumber,
+          netAmount: round2(returnNet),
+          taxAmount: round2(returnTax),
+          totalAmount: returnGross,
+          cogs: round2(returnCogs),
+          reason: body.reason ?? null,
+          createdById: req.auth!.userId,
         },
-        include: { items: true, party: true },
       });
     });
 
-    res.json({ invoice: updated, returnedAmount: returnGross });
+    res.json({ creditNote, returnedAmount: returnGross });
   })
 );
 

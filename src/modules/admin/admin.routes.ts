@@ -255,7 +255,7 @@ router.get(
     const expConditions = [Prisma.sql`"businessId" = ${id}`];
     if (from) expConditions.push(Prisma.sql`date >= ${from}`);
     if (to) expConditions.push(Prisma.sql`date <= ${to}`);
-    const [expTotalRows, monthlyExpRows] = await Promise.all([
+    const [expTotalRows, monthlyExpRows, retTotalRows, monthlyRetRows] = await Promise.all([
       prisma.$queryRaw<Array<{ total: number }>>(Prisma.sql`
         SELECT COALESCE(SUM(amount), 0)::float AS total FROM "Expense"
         WHERE ${Prisma.join(expConditions, " AND ")}
@@ -266,10 +266,35 @@ router.get(
         FROM "Expense" WHERE ${Prisma.join(expConditions, " AND ")}
         GROUP BY 1
       `),
+      // Returns (credit notes) reduce revenue and cost of goods.
+      prisma.$queryRaw<Array<{ net: number; tax: number; cogs: number }>>(Prisma.sql`
+        SELECT COALESCE(SUM("netAmount"), 0)::float AS net,
+               COALESCE(SUM("taxAmount"), 0)::float AS tax,
+               COALESCE(SUM(cogs), 0)::float AS cogs
+        FROM "CreditNote" WHERE ${Prisma.join(expConditions, " AND ")}
+      `),
+      prisma.$queryRaw<Array<{ month: string; net: number; cogs: number }>>(Prisma.sql`
+        SELECT to_char(date_trunc('month', date), 'YYYY-MM') AS month,
+               COALESCE(SUM("netAmount"), 0)::float AS net,
+               COALESCE(SUM(cogs), 0)::float AS cogs
+        FROM "CreditNote" WHERE ${Prisma.join(expConditions, " AND ")}
+        GROUP BY 1
+      `),
     ]);
     const totalExpenses = Number(expTotalRows[0]?.total ?? 0);
-    const netProfit = grossProfit - totalExpenses;
     const expByMonth = new Map(monthlyExpRows.map((r) => [r.month, Number(r.exp)]));
+
+    // Apply returns: reduce net revenue and cost of goods.
+    const returnsNet = Number(retTotalRows[0]?.net ?? 0);
+    const returnsCogs = Number(retTotalRows[0]?.cogs ?? 0);
+    const returnsTotal = returnsNet + Number(retTotalRows[0]?.tax ?? 0);
+    const adjNetRevenue = netRevenue - returnsNet;
+    const adjCogs = cogs - returnsCogs;
+    const adjGrossProfit = adjNetRevenue - adjCogs;
+    const netProfit = adjGrossProfit - totalExpenses;
+    const retByMonth = new Map(
+      monthlyRetRows.map((r) => [r.month, { net: Number(r.net), cogs: Number(r.cogs) }])
+    );
 
     // Monthly profit/loss, cash basis, net of expenses.
     const monthlyRows = await prisma.$queryRaw<
@@ -297,18 +322,25 @@ router.get(
         cogs: Number(m.cogs),
       });
     }
-    const allMonths = new Set<string>([...salesByMonth.keys(), ...expByMonth.keys()]);
+    const allMonths = new Set<string>([
+      ...salesByMonth.keys(),
+      ...expByMonth.keys(),
+      ...retByMonth.keys(),
+    ]);
     const monthly = Array.from(allMonths)
       .sort()
       .map((month) => {
         const s = salesByMonth.get(month) ?? { net: 0, cogs: 0 };
         const exp = expByMonth.get(month) ?? 0;
+        const ret = retByMonth.get(month) ?? { net: 0, cogs: 0 };
+        const net = s.net - ret.net; // revenue net of returns
+        const cgs = s.cogs - ret.cogs; // cost net of returned goods
         return {
           month,
-          salesNet: round2(s.net),
-          cogs: round2(s.cogs),
+          salesNet: round2(net),
+          cogs: round2(cgs),
           expenses: round2(exp),
-          profit: round2(s.net - s.cogs - exp),
+          profit: round2(net - cgs - exp),
         };
       });
 
@@ -322,13 +354,17 @@ router.get(
         taxrealized: number;
         cogs: number;
         expense: number;
+        retnet: number;
+        retcogs: number;
       }>
     >(Prisma.sql`
       SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
              inv."amountPaid"::float AS collected,
              (inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs,
-             COALESCE(e.exp, 0)::float AS expense
+             COALESCE(e.exp, 0)::float AS expense,
+             COALESCE(r.net, 0)::float AS retnet,
+             COALESCE(r.cogs, 0)::float AS retcogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
         SELECT SUM(ii.quantity * i."purchasePrice") AS cost
@@ -338,6 +374,10 @@ router.get(
       LEFT JOIN LATERAL (
         SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
       ) e ON true
+      LEFT JOIN LATERAL (
+        SELECT SUM("netAmount") AS net, SUM(cogs) AS cogs
+        FROM "CreditNote" cn WHERE cn."invoiceId" = inv.id
+      ) r ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       ORDER BY inv."invoiceDate" DESC, inv."invoiceNumber" DESC
       LIMIT 100
@@ -350,13 +390,14 @@ router.get(
         salesGross: round2(salesGross),
         amountCollected: round2(amountCollected),
         outstanding: round2(outstanding),
-        salesNet: round2(netRevenue),
-        cogs: round2(cogs),
-        grossProfit: round2(grossProfit),
-        grossMarginPct: netRevenue ? round2((grossProfit / netRevenue) * 100) : 0,
+        returns: round2(returnsTotal),
+        salesNet: round2(adjNetRevenue),
+        cogs: round2(adjCogs),
+        grossProfit: round2(adjGrossProfit),
+        grossMarginPct: adjNetRevenue ? round2((adjGrossProfit / adjNetRevenue) * 100) : 0,
         expenses: round2(totalExpenses),
         netProfit: round2(netProfit),
-        netMarginPct: netRevenue ? round2((netProfit / netRevenue) * 100) : 0,
+        netMarginPct: adjNetRevenue ? round2((netProfit / adjNetRevenue) * 100) : 0,
         taxCollected: round2(taxCollected),
         purchases: round2(Number(purchases._sum.total ?? 0)),
         taxPaid: round2(Number(purchases._sum.taxAmount ?? 0)),
@@ -365,8 +406,8 @@ router.get(
       },
       monthly,
       bills: billRows.map((b) => {
-        const rev = round2(Number(b.collected) - Number(b.taxrealized));
-        const c = round2(Number(b.cogs));
+        const rev = round2(Number(b.collected) - Number(b.taxrealized) - Number(b.retnet));
+        const c = round2(Number(b.cogs) - Number(b.retcogs));
         const exp = round2(Number(b.expense));
         return {
           id: b.id,
@@ -396,7 +437,7 @@ router.get(
     });
     if (!invoice) throw notFound("Bill not found");
 
-    const [cogsRows, chargeGroups] = await Promise.all([
+    const [cogsRows, chargeGroups, returnAgg] = await Promise.all([
       prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
         SELECT COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
@@ -407,20 +448,30 @@ router.get(
         where: { invoiceId: invoice.id },
         _sum: { amount: true },
       }),
+      prisma.creditNote.aggregate({
+        where: { invoiceId: invoice.id },
+        _sum: { netAmount: true, totalAmount: true, cogs: true },
+      }),
     ]);
 
-    const cogs = Number(cogsRows[0]?.cogs ?? 0);
+    const grossCogs = Number(cogsRows[0]?.cogs ?? 0);
     const charges = chargeGroups.map((g) => ({
       category: g.category,
       amount: round2(Number(g._sum.amount ?? 0)),
     }));
     const chargesTotal = charges.reduce((s, c) => s + c.amount, 0);
 
+    const returnNet = Number(returnAgg._sum.netAmount ?? 0);
+    const returnTotal = Number(returnAgg._sum.totalAmount ?? 0);
+    const returnCogs = Number(returnAgg._sum.cogs ?? 0);
+
     const subtotal = Number(invoice.subtotal);
     const discount = Number(invoice.discount);
     const gst = Number(invoice.taxAmount);
     const total = Number(invoice.total);
-    const netSale = subtotal - discount; // ex-GST sale value
+    // Net of returns.
+    const netSale = subtotal - discount - returnNet; // ex-GST, after returns
+    const cogs = grossCogs - returnCogs;
     const grossProfit = netSale - cogs;
     const netProfit = grossProfit - chargesTotal;
 
@@ -440,7 +491,8 @@ router.get(
         gst: round2(gst),
         totalBilled: round2(total), // incl GST
         amountCollected: round2(Number(invoice.amountPaid)),
-        outstanding: round2(total - Number(invoice.amountPaid)),
+        outstanding: round2(total - Number(invoice.amountPaid) - returnTotal),
+        returns: round2(returnTotal),
         cogs: round2(cogs),
         grossProfit: round2(grossProfit),
         charges,
@@ -570,7 +622,7 @@ router.get(
     if (!party) throw notFound("Party not found");
     const invoiceType = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
 
-    const [invoices, payments] = await Promise.all([
+    const [invoices, payments, creditNotes] = await Promise.all([
       prisma.invoice.findMany({
         where: { partyId: party.id, type: invoiceType as never },
         select: { invoiceNumber: true, invoiceDate: true, total: true },
@@ -578,6 +630,11 @@ router.get(
       prisma.payment.findMany({
         where: { partyId: party.id },
         select: { paymentDate: true, amount: true, method: true },
+      }),
+      // Returns (credit notes) reduce what the party owes.
+      prisma.creditNote.findMany({
+        where: { partyId: party.id },
+        select: { date: true, totalAmount: true, invoiceNumber: true },
       }),
     ]);
 
@@ -599,6 +656,15 @@ router.get(
         ref: "",
         debit: 0,
         credit: Number(p.amount),
+      });
+    }
+    for (const cn of creditNotes) {
+      entries.push({
+        date: cn.date,
+        kind: "Sales Return",
+        ref: cn.invoiceNumber ?? "",
+        debit: 0,
+        credit: Number(cn.totalAmount),
       });
     }
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
