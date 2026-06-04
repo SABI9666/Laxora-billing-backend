@@ -134,8 +134,9 @@ model Party {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
-  invoices Invoice[]
-  payments Payment[]
+  invoices      Invoice[]
+  payments      Payment[]
+  suppliedItems Item[]    @relation("ItemSupplier")
 
   @@index([businessId])
 }
@@ -168,6 +169,8 @@ model Item {
   business      Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   categoryId    String?
   category      Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  supplierId    String?
+  supplier      Party?    @relation("ItemSupplier", fields: [supplierId], references: [id], onDelete: SetNull)
   name          String
   sku           String?
   barcode       String?
@@ -190,6 +193,7 @@ model Item {
 
   @@index([businessId])
   @@index([categoryId])
+  @@index([supplierId])
   @@index([businessId, barcode])
 }
 

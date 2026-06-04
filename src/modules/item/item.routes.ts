@@ -11,6 +11,7 @@ const router = Router();
 const itemSchema = z.object({
   name: z.string().min(1),
   categoryId: z.string().optional().nullable(),
+  supplierId: z.string().optional().nullable(),
   sku: z.string().optional(),
   barcode: z.string().optional(),
   brand: z.string().optional(),
@@ -55,7 +56,7 @@ router.get(
         ...(categoryId ? { categoryId: String(categoryId) } : {}),
         ...(barcode ? { barcode: String(barcode) } : {}),
       },
-      include: { category: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
       orderBy: { name: "asc" },
     });
 
@@ -83,7 +84,7 @@ router.get(
         ...(barcode ? { barcode: String(barcode) } : {}),
         ...(sku ? { sku: String(sku) } : {}),
       },
-      include: { category: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
     });
     if (!item) throw notFound("No item matches that code");
     res.json({ item });
@@ -96,7 +97,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const item = await prisma.item.findFirst({
       where: { id: req.params.id, businessId: req.businessId! },
-      include: { category: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
     });
     if (!item) throw notFound("Item not found");
     res.json({ item });

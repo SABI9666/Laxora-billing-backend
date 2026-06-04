@@ -562,6 +562,85 @@ router.get(
   })
 );
 
+// GET /api/admin/businesses/:id/suppliers-analysis?from=&to= — per-supplier
+// performance: total purchased (IN), total sold of their products (OUT),
+// profit and margin, so you can see which supplier performs best.
+router.get(
+  "/businesses/:id/suppliers-analysis",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const { from, to } = dateRange(req);
+
+    const purCond = [Prisma.sql`"businessId" = ${id}`, Prisma.sql`type = 'PURCHASE'`];
+    if (from) purCond.push(Prisma.sql`"invoiceDate" >= ${from}`);
+    if (to) purCond.push(Prisma.sql`"invoiceDate" <= ${to}`);
+
+    const saleCond = [
+      Prisma.sql`inv."businessId" = ${id}`,
+      Prisma.sql`inv.type = 'SALE'`,
+      Prisma.sql`i."supplierId" IS NOT NULL`,
+    ];
+    if (from) saleCond.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
+    if (to) saleCond.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
+
+    const [suppliers, purchaseRows, salesRows, itemCountRows] = await Promise.all([
+      prisma.party.findMany({
+        where: { businessId: id, type: "SUPPLIER" },
+        select: { id: true, name: true, phone: true },
+        orderBy: { name: "asc" },
+      }),
+      prisma.$queryRaw<Array<{ sid: string; inval: number }>>(Prisma.sql`
+        SELECT "partyId" AS sid, COALESCE(SUM(total), 0)::float AS inval
+        FROM "Invoice" WHERE ${Prisma.join(purCond, " AND ")} GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ sid: string; outval: number; cogs: number }>>(Prisma.sql`
+        SELECT i."supplierId" AS sid,
+               COALESCE(SUM(ii.amount), 0)::float AS outval,
+               COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
+        FROM "InvoiceItem" ii
+        JOIN "Item" i ON i.id = ii."itemId"
+        JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+        WHERE ${Prisma.join(saleCond, " AND ")} GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ sid: string; cnt: number }>>(Prisma.sql`
+        SELECT "supplierId" AS sid, COUNT(*)::int AS cnt FROM "Item"
+        WHERE "businessId" = ${id} AND "supplierId" IS NOT NULL GROUP BY 1
+      `),
+    ]);
+
+    const inMap = new Map(purchaseRows.map((r) => [r.sid, Number(r.inval)]));
+    const outMap = new Map(
+      salesRows.map((r) => [r.sid, { out: Number(r.outval), cogs: Number(r.cogs) }])
+    );
+    const cntMap = new Map(itemCountRows.map((r) => [r.sid, Number(r.cnt)]));
+
+    const rows = suppliers
+      .map((s) => {
+        const purchaseIn = inMap.get(s.id) ?? 0;
+        const so = outMap.get(s.id) ?? { out: 0, cogs: 0 };
+        const profit = so.out - so.cogs;
+        return {
+          id: s.id,
+          name: s.name,
+          phone: s.phone,
+          purchaseIn: round2(purchaseIn),
+          salesOut: round2(so.out),
+          cogs: round2(so.cogs),
+          profit: round2(profit),
+          marginPct: so.out ? round2((profit / so.out) * 100) : 0,
+          productCount: cntMap.get(s.id) ?? 0,
+        };
+      })
+      .sort((a, b) => b.profit - a.profit);
+
+    const best = rows.find((r) => r.profit > 0) ?? null;
+    res.json({
+      suppliers: rows,
+      best: best ? { name: best.name, profit: best.profit, marginPct: best.marginPct } : null,
+    });
+  })
+);
+
 // GET /api/admin/businesses/:id/parties?type=CUSTOMER|SUPPLIER — ledger summary
 // (balance per party) used by the customer ledger / purchase ledger reports.
 router.get(
