@@ -186,4 +186,99 @@ router.delete(
   })
 );
 
+// POST /api/invoices/:id/return — record a sales return against a bill:
+// puts the returned items back into stock and reduces the bill's revenue,
+// tax, total and paid amount (refund). Profit reflects it automatically.
+const returnSchema = z.object({
+  reason: z.string().optional(),
+  items: z
+    .array(z.object({ invoiceItemId: z.string().min(1), quantity: z.number().positive() }))
+    .min(1),
+});
+
+router.post(
+  "/:id/return",
+  requireRole(...BILLING_ROLES),
+  validateBody(returnSchema),
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: req.params.id, businessId, type: "SALE" },
+      include: { items: true },
+    });
+    if (!invoice) throw notFound("Sale bill not found");
+
+    const body = req.body as z.infer<typeof returnSchema>;
+    const reqMap = new Map(body.items.map((i) => [i.invoiceItemId, i.quantity]));
+
+    let returnNet = 0;
+    let returnTax = 0;
+    const updates: {
+      id: string;
+      newQty: number;
+      newAmount: number;
+      itemId: string | null;
+      retQty: number;
+    }[] = [];
+    for (const li of invoice.items) {
+      const reqQty = reqMap.get(li.id);
+      if (!reqQty) continue;
+      const retQty = Math.min(reqQty, Number(li.quantity));
+      if (retQty <= 0) continue;
+      const lineNet = retQty * Number(li.rate);
+      returnNet += lineNet;
+      returnTax += (lineNet * Number(li.taxRate)) / 100;
+      updates.push({
+        id: li.id,
+        newQty: Number(li.quantity) - retQty,
+        newAmount: (Number(li.quantity) - retQty) * Number(li.rate),
+        itemId: li.itemId,
+        retQty,
+      });
+    }
+    if (updates.length === 0) throw badRequest("Nothing to return on this bill");
+
+    const returnGross = round2(returnNet + returnTax);
+
+    const updated = await prisma.$transaction(async (tx) => {
+      for (const u of updates) {
+        await tx.invoiceItem.update({
+          where: { id: u.id },
+          data: { quantity: round2(u.newQty), amount: round2(u.newAmount) },
+        });
+        if (u.itemId) {
+          await recordStockMovement(tx, {
+            businessId,
+            itemId: u.itemId,
+            type: StockMovementType.IN,
+            quantity: u.retQty,
+            reason: `Sales return${body.reason ? ` - ${body.reason}` : ""}`,
+            reference: invoice.invoiceNumber,
+            invoiceId: invoice.id,
+            createdById: req.auth!.userId,
+          });
+        }
+      }
+      const newTotal = round2(Number(invoice.total) - returnGross);
+      const refund = Math.min(Number(invoice.amountPaid), returnGross);
+      const newPaid = round2(Number(invoice.amountPaid) - refund);
+      const status: "UNPAID" | "PARTIAL" | "PAID" =
+        newPaid <= 0 ? "UNPAID" : newPaid >= newTotal ? "PAID" : "PARTIAL";
+      return tx.invoice.update({
+        where: { id: invoice.id },
+        data: {
+          subtotal: round2(Number(invoice.subtotal) - returnNet),
+          taxAmount: round2(Number(invoice.taxAmount) - returnTax),
+          total: newTotal,
+          amountPaid: newPaid,
+          status,
+        },
+        include: { items: true, party: true },
+      });
+    });
+
+    res.json({ invoice: updated, returnedAmount: returnGross });
+  })
+);
+
 export default router;
