@@ -118,7 +118,8 @@ router.post(
   })
 );
 
-// PUT /api/items/:id
+// PUT /api/items/:id — shop edits go to the admin as a pending approval
+// request (platform admins edit directly).
 router.put(
   "/:id",
   requireRole(...SHOP_MANAGERS),
@@ -129,11 +130,37 @@ router.put(
     });
     if (!existing) throw notFound("Item not found");
     await assertCategory(req.businessId!, req.body.categoryId);
-    const item = await prisma.item.update({
-      where: { id: req.params.id },
-      data: req.body,
+
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth!.userId },
+      select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
-    res.json({ item });
+
+    // Platform admins apply changes immediately.
+    if (user?.isPlatformAdmin) {
+      const item = await prisma.item.update({
+        where: { id: req.params.id },
+        data: req.body,
+      });
+      return res.json({ item });
+    }
+
+    // Everyone else: hold as a pending change request for admin approval.
+    const request = await prisma.itemChangeRequest.create({
+      data: {
+        businessId: req.businessId!,
+        itemId: existing.id,
+        itemName: existing.name,
+        changes: req.body,
+        requestedById: req.auth!.userId,
+        requestedByName: user?.name ?? user?.username ?? user?.email ?? null,
+      },
+    });
+    res.status(202).json({
+      pending: true,
+      request,
+      message: "Your change was sent to the admin for approval.",
+    });
   })
 );
 

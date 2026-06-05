@@ -84,6 +84,7 @@ model Business {
   stockMovements StockMovement[]
   expenses       Expense[]
   creditNotes    CreditNote[]
+  changeRequests ItemChangeRequest[]
 
   @@index([franchiseId])
 }
@@ -372,4 +373,27 @@ model CreditNote {
   @@index([partyId])
   @@index([invoiceId])
   @@index([businessId, date])
+}
+
+// ----------------------------------------------------------------------------
+// Product edit approvals — a shop's product edit is held as a pending request
+// until the platform admin approves it, then the change is applied.
+// ----------------------------------------------------------------------------
+
+model ItemChangeRequest {
+  id              String    @id @default(cuid())
+  businessId      String
+  business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  itemId          String
+  itemName        String // snapshot of the product name for display
+  changes         Json // proposed new field values
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  requestedById   String?
+  requestedByName String?
+  createdAt       DateTime  @default(now())
+  reviewedAt      DateTime?
+
+  @@index([businessId])
+  @@index([status])
+  @@index([businessId, status])
 }

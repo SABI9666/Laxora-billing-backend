@@ -871,6 +871,76 @@ router.delete(
   })
 );
 
+// ---- Product edit approvals ------------------------------------------------
+
+// GET /api/admin/change-requests?status=PENDING — product edits awaiting review.
+router.get(
+  "/change-requests",
+  asyncHandler(async (req, res) => {
+    const status = req.query.status ? String(req.query.status) : "PENDING";
+    const requests = await prisma.itemChangeRequest.findMany({
+      where: { status },
+      include: { business: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    res.json({ requests, pendingCount: requests.length });
+  })
+);
+
+// GET /api/admin/change-requests/:id — request + current item, for the diff.
+router.get(
+  "/change-requests/:id",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.itemChangeRequest.findUnique({
+      where: { id: req.params.id },
+      include: { business: { select: { name: true } } },
+    });
+    if (!request) throw notFound("Request not found");
+    const item = await prisma.item.findUnique({ where: { id: request.itemId } });
+    res.json({ request, item });
+  })
+);
+
+// POST /api/admin/change-requests/:id/approve — apply the edit.
+router.post(
+  "/change-requests/:id/approve",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.itemChangeRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    if (request.status !== "PENDING") throw badRequest("This request was already reviewed");
+    await prisma.$transaction(async (tx) => {
+      await tx.item.update({
+        where: { id: request.itemId },
+        data: request.changes as Prisma.ItemUpdateInput,
+      });
+      await tx.itemChangeRequest.update({
+        where: { id: request.id },
+        data: { status: "APPROVED", reviewedAt: new Date() },
+      });
+    });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/admin/change-requests/:id/reject — discard the edit.
+router.post(
+  "/change-requests/:id/reject",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.itemChangeRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    await prisma.itemChangeRequest.update({
+      where: { id: request.id },
+      data: { status: "REJECTED", reviewedAt: new Date() },
+    });
+    res.status(204).send();
+  })
+);
+
 // GET /api/admin/users — every user with their business count.
 router.get(
   "/users",
