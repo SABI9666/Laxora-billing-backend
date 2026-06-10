@@ -657,39 +657,60 @@ router.get(
     const { from, to } = dateRange(req);
 
     // Cash = CASH method; everything else (bank/UPI/card/cheque) hits the bank.
-    const flows = (rows: Array<{ direction: string; method: string; amt: number }>) => {
-      let inCash = 0,
-        inBank = 0,
-        outCash = 0,
-        outBank = 0;
+    // "Bank Deposit"/"Bank Withdrawal" are internal cash<->bank transfers (they
+    // move money between cash and bank, but aren't real credit/debit).
+    const flows = (
+      rows: Array<{ direction: string; method: string; purpose: string | null; amt: number }>
+    ) => {
+      let credit = 0,
+        debit = 0,
+        cashDelta = 0,
+        bankDelta = 0;
       for (const r of rows) {
+        if (r.purpose === "Bank Deposit") {
+          cashDelta -= r.amt;
+          bankDelta += r.amt;
+          continue;
+        }
+        if (r.purpose === "Bank Withdrawal") {
+          bankDelta -= r.amt;
+          cashDelta += r.amt;
+          continue;
+        }
         const cash = r.method === "CASH";
-        if (r.direction === "IN") cash ? (inCash += r.amt) : (inBank += r.amt);
-        else cash ? (outCash += r.amt) : (outBank += r.amt);
+        if (r.direction === "IN") {
+          credit += r.amt;
+          cash ? (cashDelta += r.amt) : (bankDelta += r.amt);
+        } else {
+          debit += r.amt;
+          cash ? (cashDelta -= r.amt) : (bankDelta -= r.amt);
+        }
       }
-      return { inCash, inBank, outCash, outBank };
+      return { credit, debit, cashDelta, bankDelta };
     };
 
     const [beforeRows, rangeRows, receivableInvoices, payableInvoices, creditNotes] =
       await Promise.all([
         // Movements before the period — to roll the opening balance forward.
         from
-          ? prisma.$queryRaw<Array<{ direction: string; method: string; amt: number }>>(
-              Prisma.sql`SELECT direction::text, method::text, COALESCE(SUM(amount),0)::float AS amt
+          ? prisma.$queryRaw<
+              Array<{ direction: string; method: string; purpose: string | null; amt: number }>
+            >(
+              Prisma.sql`SELECT direction::text, method::text, purpose, COALESCE(SUM(amount),0)::float AS amt
                          FROM "Payment" WHERE "businessId" = ${id} AND "paymentDate" < ${from}
-                         GROUP BY 1, 2`
+                         GROUP BY 1, 2, 3`
             )
           : Promise.resolve([]),
         prisma.$queryRaw<
-          Array<{ day: string; direction: string; method: string; amt: number }>
+          Array<{ day: string; direction: string; method: string; purpose: string | null; amt: number }>
         >(Prisma.sql`
           SELECT to_char(date_trunc('day', "paymentDate"), 'YYYY-MM-DD') AS day,
-                 direction::text, method::text, COALESCE(SUM(amount),0)::float AS amt
+                 direction::text, method::text, purpose, COALESCE(SUM(amount),0)::float AS amt
           FROM "Payment"
           WHERE "businessId" = ${id}
             ${from ? Prisma.sql`AND "paymentDate" >= ${from}` : Prisma.empty}
             ${to ? Prisma.sql`AND "paymentDate" <= ${to}` : Prisma.empty}
-          GROUP BY 1, 2, 3 ORDER BY 1
+          GROUP BY 1, 2, 3, 4 ORDER BY 1
         `),
         prisma.invoice.findMany({
           where: { businessId: id, type: "SALE", status: { in: ["UNPAID", "PARTIAL"] } },
@@ -729,13 +750,16 @@ router.get(
 
     // Opening balances at the start of the period.
     const before = flows(beforeRows);
-    let cash = Number(business.openingCash) + before.inCash - before.outCash;
-    let bank = Number(business.openingBank) + before.inBank - before.outBank;
+    let cash = Number(business.openingCash) + before.cashDelta;
+    let bank = Number(business.openingBank) + before.bankDelta;
     const openingCash = round2(cash);
     const openingBank = round2(bank);
 
     // Daily rows with running balances.
-    const byDay = new Map<string, Array<{ direction: string; method: string; amt: number }>>();
+    const byDay = new Map<
+      string,
+      Array<{ direction: string; method: string; purpose: string | null; amt: number }>
+    >();
     for (const r of rangeRows) {
       const list = byDay.get(r.day) ?? [];
       list.push(r);
@@ -745,16 +769,12 @@ router.get(
       .sort()
       .map((day) => {
         const f = flows(byDay.get(day)!);
-        cash += f.inCash - f.outCash;
-        bank += f.inBank - f.outBank;
+        cash += f.cashDelta;
+        bank += f.bankDelta;
         return {
           day,
-          credit: round2(f.inCash + f.inBank),
-          debit: round2(f.outCash + f.outBank),
-          inCash: round2(f.inCash),
-          inBank: round2(f.inBank),
-          outCash: round2(f.outCash),
-          outBank: round2(f.outBank),
+          credit: round2(f.credit),
+          debit: round2(f.debit),
           cashBalance: round2(cash),
           bankBalance: round2(bank),
         };

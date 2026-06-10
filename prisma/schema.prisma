@@ -284,11 +284,14 @@ model Payment {
   id          String           @id @default(cuid())
   businessId  String
   business    Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  partyId     String
-  party       Party            @relation(fields: [partyId], references: [id])
+  partyId     String?
+  party       Party?           @relation(fields: [partyId], references: [id])
   invoiceId   String?
   invoice     Invoice?         @relation(fields: [invoiceId], references: [id])
   direction   PaymentDirection @default(IN)
+  // What the voucher is for: "Supplier Payment", "Customer Receipt", "Expense",
+  // "Bank Deposit" (cash->bank), "Bank Withdrawal" (bank->cash), "Other".
+  purpose     String?
   amount      Decimal          @db.Decimal(14, 2)
   method      PaymentMethod    @default(CASH)
   paymentDate DateTime         @default(now())

@@ -8,10 +8,12 @@ import { badRequest, notFound } from "../../utils/errors";
 const router = Router();
 
 const paymentSchema = z.object({
-  partyId: z.string().min(1),
+  partyId: z.string().optional(),
   invoiceId: z.string().optional(),
   // IN = credit voucher (money received), OUT = payment voucher (money given).
   direction: z.enum(["IN", "OUT"]).default("IN"),
+  // Supplier Payment | Customer Receipt | Expense | Bank Deposit | Bank Withdrawal | Other
+  purpose: z.string().optional(),
   amount: z.number().positive(),
   method: z.enum(["CASH", "BANK", "UPI", "CARD", "CHEQUE", "OTHER"]).default("CASH"),
   paymentDate: z.coerce.date().optional(),
@@ -48,10 +50,13 @@ router.post(
     const body = req.body as z.infer<typeof paymentSchema>;
     const businessId = req.businessId!;
 
-    const party = await prisma.party.findFirst({
-      where: { id: body.partyId, businessId },
-    });
-    if (!party) throw badRequest("Invalid partyId for this business");
+    // Party is optional (expenses, bank deposits, etc. have no party).
+    if (body.partyId) {
+      const party = await prisma.party.findFirst({
+        where: { id: body.partyId, businessId },
+      });
+      if (!party) throw badRequest("Invalid partyId for this business");
+    }
 
     if (body.invoiceId) {
       const invoice = await prisma.invoice.findFirst({
@@ -64,9 +69,10 @@ router.post(
       const created = await tx.payment.create({
         data: {
           businessId,
-          partyId: body.partyId,
+          partyId: body.partyId ?? null,
           invoiceId: body.invoiceId ?? null,
           direction: body.direction,
+          purpose: body.purpose ?? null,
           amount: body.amount,
           method: body.method,
           paymentDate: body.paymentDate ?? new Date(),
