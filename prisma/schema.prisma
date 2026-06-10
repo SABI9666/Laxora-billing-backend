@@ -72,6 +72,10 @@ model Business {
   // Next invoice numbers (simple auto-increment per business)
   nextSaleNo     Int        @default(1)
   nextPurchaseNo Int        @default(1)
+  // Opening balances — the cash in the shop and money in the bank when you
+  // start using Laxora. The cash book builds on top of these.
+  openingCash    Decimal    @default(0) @db.Decimal(14, 2)
+  openingBank    Decimal    @default(0) @db.Decimal(14, 2)
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @updatedAt
 
@@ -269,22 +273,31 @@ enum PaymentMethod {
   OTHER
 }
 
+// Direction of money: IN = credit voucher (money received),
+// OUT = payment voucher (money given, e.g. to a supplier).
+enum PaymentDirection {
+  IN
+  OUT
+}
+
 model Payment {
-  id          String        @id @default(cuid())
+  id          String           @id @default(cuid())
   businessId  String
-  business    Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business    Business         @relation(fields: [businessId], references: [id], onDelete: Cascade)
   partyId     String
-  party       Party         @relation(fields: [partyId], references: [id])
+  party       Party            @relation(fields: [partyId], references: [id])
   invoiceId   String?
-  invoice     Invoice?      @relation(fields: [invoiceId], references: [id])
-  amount      Decimal       @db.Decimal(14, 2)
-  method      PaymentMethod @default(CASH)
-  paymentDate DateTime      @default(now())
+  invoice     Invoice?         @relation(fields: [invoiceId], references: [id])
+  direction   PaymentDirection @default(IN)
+  amount      Decimal          @db.Decimal(14, 2)
+  method      PaymentMethod    @default(CASH)
+  paymentDate DateTime         @default(now())
   notes       String?
-  createdAt   DateTime      @default(now())
+  createdAt   DateTime         @default(now())
 
   @@index([businessId])
   @@index([partyId])
+  @@index([businessId, paymentDate])
 }
 
 // ----------------------------------------------------------------------------

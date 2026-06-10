@@ -13,6 +13,9 @@ const updateSchema = z.object({
   email: z.string().email().optional().or(z.literal("")),
   address: z.string().optional(),
   logoUrl: z.string().url().optional().or(z.literal("")),
+  // Starting balances for the cash book (cash in shop / money in bank).
+  openingCash: z.number().optional(),
+  openingBank: z.number().optional(),
 });
 
 // GET /api/business — the active business profile.

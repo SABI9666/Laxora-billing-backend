@@ -10,24 +10,30 @@ const router = Router();
 const paymentSchema = z.object({
   partyId: z.string().min(1),
   invoiceId: z.string().optional(),
+  // IN = credit voucher (money received), OUT = payment voucher (money given).
+  direction: z.enum(["IN", "OUT"]).default("IN"),
   amount: z.number().positive(),
   method: z.enum(["CASH", "BANK", "UPI", "CARD", "CHEQUE", "OTHER"]).default("CASH"),
   paymentDate: z.coerce.date().optional(),
   notes: z.string().optional(),
 });
 
-// GET /api/payments?partyId=&invoiceId=
+// GET /api/payments?partyId=&invoiceId=&direction=
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { partyId, invoiceId } = req.query;
+    const { partyId, invoiceId, direction } = req.query;
     const payments = await prisma.payment.findMany({
       where: {
         businessId: req.businessId!,
         ...(partyId ? { partyId: String(partyId) } : {}),
         ...(invoiceId ? { invoiceId: String(invoiceId) } : {}),
+        ...(direction ? { direction: direction as "IN" | "OUT" } : {}),
       },
-      include: { party: { select: { id: true, name: true } } },
+      include: {
+        party: { select: { id: true, name: true } },
+        invoice: { select: { id: true, invoiceNumber: true } },
+      },
       orderBy: { paymentDate: "desc" },
     });
     res.json({ payments });
@@ -60,6 +66,7 @@ router.post(
           businessId,
           partyId: body.partyId,
           invoiceId: body.invoiceId ?? null,
+          direction: body.direction,
           amount: body.amount,
           method: body.method,
           paymentDate: body.paymentDate ?? new Date(),

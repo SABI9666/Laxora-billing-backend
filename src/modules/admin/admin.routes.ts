@@ -641,6 +641,171 @@ router.get(
   })
 );
 
+// GET /api/admin/businesses/:id/cashbook?from=&to= — day book: daily credit
+// (money in) / debit (money out), running cash & bank balances, plus the
+// receivable and payable bills behind "balance to receive / to pay".
+router.get(
+  "/businesses/:id/cashbook",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const business = await prisma.business.findUnique({
+      where: { id },
+      select: { name: true, openingCash: true, openingBank: true },
+    });
+    if (!business) throw notFound("Shop not found");
+
+    const { from, to } = dateRange(req);
+
+    // Cash = CASH method; everything else (bank/UPI/card/cheque) hits the bank.
+    const flows = (rows: Array<{ direction: string; method: string; amt: number }>) => {
+      let inCash = 0,
+        inBank = 0,
+        outCash = 0,
+        outBank = 0;
+      for (const r of rows) {
+        const cash = r.method === "CASH";
+        if (r.direction === "IN") cash ? (inCash += r.amt) : (inBank += r.amt);
+        else cash ? (outCash += r.amt) : (outBank += r.amt);
+      }
+      return { inCash, inBank, outCash, outBank };
+    };
+
+    const [beforeRows, rangeRows, receivableInvoices, payableInvoices, creditNotes] =
+      await Promise.all([
+        // Movements before the period — to roll the opening balance forward.
+        from
+          ? prisma.$queryRaw<Array<{ direction: string; method: string; amt: number }>>(
+              Prisma.sql`SELECT direction::text, method::text, COALESCE(SUM(amount),0)::float AS amt
+                         FROM "Payment" WHERE "businessId" = ${id} AND "paymentDate" < ${from}
+                         GROUP BY 1, 2`
+            )
+          : Promise.resolve([]),
+        prisma.$queryRaw<
+          Array<{ day: string; direction: string; method: string; amt: number }>
+        >(Prisma.sql`
+          SELECT to_char(date_trunc('day', "paymentDate"), 'YYYY-MM-DD') AS day,
+                 direction::text, method::text, COALESCE(SUM(amount),0)::float AS amt
+          FROM "Payment"
+          WHERE "businessId" = ${id}
+            ${from ? Prisma.sql`AND "paymentDate" >= ${from}` : Prisma.empty}
+            ${to ? Prisma.sql`AND "paymentDate" <= ${to}` : Prisma.empty}
+          GROUP BY 1, 2, 3 ORDER BY 1
+        `),
+        prisma.invoice.findMany({
+          where: { businessId: id, type: "SALE", status: { in: ["UNPAID", "PARTIAL"] } },
+          include: { party: { select: { name: true } } },
+          orderBy: { invoiceDate: "asc" },
+        }),
+        prisma.invoice.findMany({
+          where: { businessId: id, type: "PURCHASE", status: { in: ["UNPAID", "PARTIAL"] } },
+          include: { party: { select: { name: true } } },
+          orderBy: { invoiceDate: "asc" },
+        }),
+        prisma.creditNote.groupBy({
+          by: ["invoiceId"],
+          where: { businessId: id },
+          _sum: { totalAmount: true },
+        }),
+      ]);
+
+    const cnMap = new Map(
+      creditNotes.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
+    );
+    const bill = (inv: (typeof receivableInvoices)[number]) => {
+      const due =
+        Number(inv.total) - Number(inv.amountPaid) - (cnMap.get(inv.id) ?? 0);
+      return {
+        id: inv.id,
+        number: inv.invoiceNumber,
+        party: inv.party?.name ?? "—",
+        date: inv.invoiceDate,
+        total: round2(Number(inv.total)),
+        paid: round2(Number(inv.amountPaid)),
+        due: round2(due),
+      };
+    };
+    const receivables = receivableInvoices.map(bill).filter((b) => b.due > 0.009);
+    const payables = payableInvoices.map(bill).filter((b) => b.due > 0.009);
+
+    // Opening balances at the start of the period.
+    const before = flows(beforeRows);
+    let cash = Number(business.openingCash) + before.inCash - before.outCash;
+    let bank = Number(business.openingBank) + before.inBank - before.outBank;
+    const openingCash = round2(cash);
+    const openingBank = round2(bank);
+
+    // Daily rows with running balances.
+    const byDay = new Map<string, Array<{ direction: string; method: string; amt: number }>>();
+    for (const r of rangeRows) {
+      const list = byDay.get(r.day) ?? [];
+      list.push(r);
+      byDay.set(r.day, list);
+    }
+    const days = Array.from(byDay.keys())
+      .sort()
+      .map((day) => {
+        const f = flows(byDay.get(day)!);
+        cash += f.inCash - f.outCash;
+        bank += f.inBank - f.outBank;
+        return {
+          day,
+          credit: round2(f.inCash + f.inBank),
+          debit: round2(f.outCash + f.outBank),
+          inCash: round2(f.inCash),
+          inBank: round2(f.inBank),
+          outCash: round2(f.outCash),
+          outBank: round2(f.outBank),
+          cashBalance: round2(cash),
+          bankBalance: round2(bank),
+        };
+      });
+
+    res.json({
+      shop: business.name,
+      openingCash,
+      openingBank,
+      cashBalance: round2(cash),
+      bankBalance: round2(bank),
+      toReceive: round2(receivables.reduce((s, b) => s + b.due, 0)),
+      toPay: round2(payables.reduce((s, b) => s + b.due, 0)),
+      days,
+      receivables,
+      payables,
+    });
+  })
+);
+
+// GET /api/admin/businesses/:id/vouchers?direction=IN|OUT&from=&to= — credit /
+// payment voucher report with party, bill and cash/bank details.
+router.get(
+  "/businesses/:id/vouchers",
+  asyncHandler(async (req, res) => {
+    const { from, to, filter: _f } = dateRange(req);
+    const direction = req.query.direction ? String(req.query.direction) : undefined;
+    const payments = await prisma.payment.findMany({
+      where: {
+        businessId: req.params.id,
+        ...(direction === "IN" || direction === "OUT" ? { direction } : {}),
+        ...(from || to
+          ? {
+              paymentDate: {
+                ...(from ? { gte: from } : {}),
+                ...(to ? { lte: to } : {}),
+              },
+            }
+          : {}),
+      },
+      include: {
+        party: { select: { name: true, type: true } },
+        invoice: { select: { invoiceNumber: true } },
+      },
+      orderBy: { paymentDate: "desc" },
+      take: 500,
+    });
+    res.json({ payments });
+  })
+);
+
 // GET /api/admin/businesses/:id/parties?type=CUSTOMER|SUPPLIER — ledger summary
 // (balance per party) used by the customer ledger / purchase ledger reports.
 router.get(
