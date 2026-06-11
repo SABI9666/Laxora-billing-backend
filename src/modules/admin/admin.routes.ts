@@ -604,7 +604,7 @@ router.get(
     if (from) saleCond.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
     if (to) saleCond.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
 
-    const [suppliers, purchaseRows, salesRows, itemCountRows] = await Promise.all([
+    const [suppliers, purchaseRows, salesRows, itemCountRows, stockRows] = await Promise.all([
       prisma.party.findMany({
         where: { businessId: id, type: "SUPPLIER" },
         select: { id: true, name: true, phone: true },
@@ -627,6 +627,14 @@ router.get(
         SELECT "supplierId" AS sid, COUNT(*)::int AS cnt FROM "Item"
         WHERE "businessId" = ${id} AND "supplierId" IS NOT NULL GROUP BY 1
       `),
+      // Current stock value of each supplier's products (qty * purchase price).
+      prisma.$queryRaw<Array<{ sid: string; value: number }>>(Prisma.sql`
+        SELECT "supplierId" AS sid,
+               COALESCE(SUM("stockQty" * "purchasePrice"), 0)::float AS value
+        FROM "Item"
+        WHERE "businessId" = ${id} AND "supplierId" IS NOT NULL AND "isService" = false
+        GROUP BY 1
+      `),
     ]);
 
     const inMap = new Map(purchaseRows.map((r) => [r.sid, Number(r.inval)]));
@@ -634,6 +642,7 @@ router.get(
       salesRows.map((r) => [r.sid, { out: Number(r.outval), cogs: Number(r.cogs) }])
     );
     const cntMap = new Map(itemCountRows.map((r) => [r.sid, Number(r.cnt)]));
+    const stockMap = new Map(stockRows.map((r) => [r.sid, Number(r.value)]));
 
     const rows = suppliers
       .map((s) => {
@@ -650,6 +659,7 @@ router.get(
           profit: round2(profit),
           marginPct: so.out ? round2((profit / so.out) * 100) : 0,
           productCount: cntMap.get(s.id) ?? 0,
+          stockValue: round2(stockMap.get(s.id) ?? 0),
         };
       })
       .sort((a, b) => b.profit - a.profit);
@@ -658,6 +668,52 @@ router.get(
     res.json({
       suppliers: rows,
       best: best ? { name: best.name, profit: best.profit, marginPct: best.marginPct } : null,
+    });
+  })
+);
+
+// GET /api/admin/parties/:partyId/stock — all stock items supplied by this
+// supplier (for the Supplier Analysis stock drill-down).
+router.get(
+  "/parties/:partyId/stock",
+  asyncHandler(async (req, res) => {
+    const party = await prisma.party.findUnique({
+      where: { id: req.params.partyId },
+      select: { id: true, name: true, businessId: true },
+    });
+    if (!party) throw notFound("Supplier not found");
+
+    const items = await prisma.item.findMany({
+      where: { supplierId: party.id, isService: false },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        unit: true,
+        stockQty: true,
+        purchasePrice: true,
+        salePrice: true,
+        lowStockAlert: true,
+      },
+      orderBy: { name: "asc" },
+    });
+
+    const rows = items.map((i) => ({
+      id: i.id,
+      name: i.name,
+      sku: i.sku,
+      unit: i.unit,
+      stockQty: Number(i.stockQty),
+      purchasePrice: round2(Number(i.purchasePrice)),
+      salePrice: round2(Number(i.salePrice)),
+      low: Number(i.stockQty) <= Number(i.lowStockAlert),
+      value: round2(Number(i.stockQty) * Number(i.purchasePrice)),
+    }));
+
+    res.json({
+      supplier: { id: party.id, name: party.name },
+      totalValue: round2(rows.reduce((s, r) => s + r.value, 0)),
+      items: rows,
     });
   })
 );
