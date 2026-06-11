@@ -36,6 +36,63 @@ router.get(
   })
 );
 
+// GET /api/parties/summary?type=CUSTOMER|SUPPLIER — every party with billed /
+// paid / balance, for the shop's ledger reports. (Registered before /:id.)
+router.get(
+  "/summary",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const type =
+      String(req.query.type ?? "CUSTOMER").toUpperCase() === "SUPPLIER"
+        ? "SUPPLIER"
+        : "CUSTOMER";
+    const invoiceType = type === "CUSTOMER" ? "SALE" : "PURCHASE";
+    const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+
+    const [parties, invAgg, payAgg, cnAgg] = await Promise.all([
+      prisma.party.findMany({
+        where: { businessId, type: type as never },
+        orderBy: { name: "asc" },
+      }),
+      prisma.invoice.groupBy({
+        by: ["partyId"],
+        where: { businessId, type: invoiceType as never },
+        _sum: { total: true },
+      }),
+      prisma.payment.groupBy({
+        by: ["partyId"],
+        where: { businessId },
+        _sum: { amount: true },
+      }),
+      prisma.creditNote.groupBy({
+        by: ["partyId"],
+        where: { businessId },
+        _sum: { totalAmount: true },
+      }),
+    ]);
+
+    const invMap = new Map(invAgg.map((r) => [r.partyId, Number(r._sum.total ?? 0)]));
+    const payMap = new Map(payAgg.map((r) => [r.partyId, Number(r._sum.amount ?? 0)]));
+    const cnMap = new Map(cnAgg.map((r) => [r.partyId, Number(r._sum.totalAmount ?? 0)]));
+
+    const rows = parties.map((p) => {
+      const billed = invMap.get(p.id) ?? 0;
+      const paid = payMap.get(p.id) ?? 0;
+      const returns = cnMap.get(p.id) ?? 0;
+      return {
+        id: p.id,
+        name: p.name,
+        phone: p.phone,
+        gstin: p.gstin,
+        billed: round2(billed),
+        paid: round2(paid),
+        balance: round2(Number(p.openingBalance) + billed - paid - returns),
+      };
+    });
+    res.json({ type, parties: rows });
+  })
+);
+
 // GET /api/parties/:id
 router.get(
   "/:id",
