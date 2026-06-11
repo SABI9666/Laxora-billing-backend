@@ -627,12 +627,17 @@ router.get(
         SELECT "supplierId" AS sid, COUNT(*)::int AS cnt FROM "Item"
         WHERE "businessId" = ${id} AND "supplierId" IS NOT NULL GROUP BY 1
       `),
-      // Current stock value of each supplier's products (qty * purchase price).
+      // Stock value of each supplier's products as of the selected "To" date
+      // (reconstructed from the stock ledger). No date => current stock.
       prisma.$queryRaw<Array<{ sid: string; value: number }>>(Prisma.sql`
-        SELECT "supplierId" AS sid,
-               COALESCE(SUM("stockQty" * "purchasePrice"), 0)::float AS value
-        FROM "Item"
-        WHERE "businessId" = ${id} AND "supplierId" IS NOT NULL AND "isService" = false
+        SELECT i."supplierId" AS sid,
+               COALESCE(SUM(${
+                 to
+                   ? Prisma.sql`(i."stockQty" - COALESCE((SELECT SUM(quantity) FROM "StockMovement" sm WHERE sm."itemId" = i.id AND sm."createdAt" > ${to}), 0))`
+                   : Prisma.sql`i."stockQty"`
+               } * i."purchasePrice"), 0)::float AS value
+        FROM "Item" i
+        WHERE i."businessId" = ${id} AND i."supplierId" IS NOT NULL AND i."isService" = false
         GROUP BY 1
       `),
     ]);
@@ -672,8 +677,9 @@ router.get(
   })
 );
 
-// GET /api/admin/parties/:partyId/stock — all stock items supplied by this
-// supplier (for the Supplier Analysis stock drill-down).
+// GET /api/admin/parties/:partyId/stock?from=&to= — all stock items supplied
+// by this supplier. Stock value is as of the "To" date; stock in/out are the
+// movements within the date range.
 router.get(
   "/parties/:partyId/stock",
   asyncHandler(async (req, res) => {
@@ -683,37 +689,69 @@ router.get(
     });
     if (!party) throw notFound("Supplier not found");
 
-    const items = await prisma.item.findMany({
-      where: { supplierId: party.id, isService: false },
-      select: {
-        id: true,
-        name: true,
-        sku: true,
-        unit: true,
-        stockQty: true,
-        purchasePrice: true,
-        salePrice: true,
-        lowStockAlert: true,
-      },
-      orderBy: { name: "asc" },
-    });
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined;
 
-    const rows = items.map((i) => ({
-      id: i.id,
-      name: i.name,
-      sku: i.sku,
-      unit: i.unit,
-      stockQty: Number(i.stockQty),
-      purchasePrice: round2(Number(i.purchasePrice)),
-      salePrice: round2(Number(i.salePrice)),
-      low: Number(i.stockQty) <= Number(i.lowStockAlert),
-      value: round2(Number(i.stockQty) * Number(i.purchasePrice)),
+    const rangeCond = (signFilter: ReturnType<typeof Prisma.sql>) => {
+      const conds = [Prisma.sql`sm."itemId" = i.id`, signFilter];
+      if (from) conds.push(Prisma.sql`sm."createdAt" >= ${from}`);
+      if (to) conds.push(Prisma.sql`sm."createdAt" <= ${to}`);
+      return Prisma.join(conds, " AND ");
+    };
+
+    const rows = await prisma.$queryRaw<
+      Array<{
+        id: string;
+        name: string;
+        sku: string | null;
+        unit: string;
+        purchaseprice: number;
+        saleprice: number;
+        lowalert: number;
+        qtyasof: number;
+        inqty: number;
+        outqty: number;
+      }>
+    >(Prisma.sql`
+      SELECT i.id, i.name, i.sku, i.unit,
+             i."purchasePrice"::float AS purchaseprice,
+             i."salePrice"::float AS saleprice,
+             i."lowStockAlert"::float AS lowalert,
+             (i."stockQty" - ${
+               to
+                 ? Prisma.sql`COALESCE((SELECT SUM(quantity) FROM "StockMovement" sm WHERE sm."itemId" = i.id AND sm."createdAt" > ${to}), 0)`
+                 : Prisma.sql`0`
+             })::float AS qtyasof,
+             COALESCE((SELECT SUM(quantity) FROM "StockMovement" sm WHERE ${rangeCond(
+               Prisma.sql`quantity > 0`
+             )}), 0)::float AS inqty,
+             COALESCE((SELECT SUM(-quantity) FROM "StockMovement" sm WHERE ${rangeCond(
+               Prisma.sql`quantity < 0`
+             )}), 0)::float AS outqty
+      FROM "Item" i
+      WHERE i."supplierId" = ${party.id} AND i."isService" = false
+      ORDER BY i.name ASC
+    `);
+
+    const items = rows.map((r) => ({
+      id: r.id,
+      name: r.name,
+      sku: r.sku,
+      unit: r.unit,
+      stockQty: round2(Number(r.qtyasof)),
+      stockIn: round2(Number(r.inqty)),
+      stockOut: round2(Number(r.outqty)),
+      purchasePrice: round2(Number(r.purchaseprice)),
+      salePrice: round2(Number(r.saleprice)),
+      low: Number(r.qtyasof) <= Number(r.lowalert),
+      value: round2(Number(r.qtyasof) * Number(r.purchaseprice)),
     }));
 
     res.json({
       supplier: { id: party.id, name: party.name },
-      totalValue: round2(rows.reduce((s, r) => s + r.value, 0)),
-      items: rows,
+      asOf: to ?? null,
+      totalValue: round2(items.reduce((s, r) => s + r.value, 0)),
+      items,
     });
   })
 );
