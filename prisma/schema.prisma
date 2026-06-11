@@ -89,6 +89,7 @@ model Business {
   expenses       Expense[]
   creditNotes    CreditNote[]
   changeRequests ItemChangeRequest[]
+  deleteRequests InvoiceDeleteRequest[]
 
   @@index([franchiseId])
 }
@@ -412,4 +413,26 @@ model ItemChangeRequest {
   @@index([businessId])
   @@index([status])
   @@index([businessId, status])
+}
+
+// A shop's request to delete an invoice — held for platform-admin approval.
+// On approval the bill is deleted (with stock reversal); on reject it stays.
+model InvoiceDeleteRequest {
+  id              String    @id @default(cuid())
+  businessId      String
+  business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  invoiceId       String
+  invoiceNumber   String
+  partyName       String?
+  total           Decimal   @default(0) @db.Decimal(14, 2)
+  reason          String?
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  requestedById   String?
+  requestedByName String?
+  createdAt       DateTime  @default(now())
+  reviewedAt      DateTime?
+
+  @@index([businessId])
+  @@index([status])
+  @@index([invoiceId])
 }

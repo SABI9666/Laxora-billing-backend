@@ -6,6 +6,7 @@ import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
+import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
 const router = Router();
@@ -1182,17 +1183,73 @@ router.delete(
 // ---- Product edit approvals ------------------------------------------------
 
 // GET /api/admin/change-requests?status=PENDING — product edits awaiting review.
+// pendingCount includes invoice-deletion requests so the sidebar badge covers both.
 router.get(
   "/change-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
-    const requests = await prisma.itemChangeRequest.findMany({
+    const [requests, deletePending] = await Promise.all([
+      prisma.itemChangeRequest.findMany({
+        where: { status },
+        include: { business: { select: { name: true } } },
+        orderBy: { createdAt: "desc" },
+        take: 200,
+      }),
+      prisma.invoiceDeleteRequest.count({ where: { status: "PENDING" } }),
+    ]);
+    res.json({ requests, pendingCount: requests.length + deletePending });
+  })
+);
+
+// ---- Invoice deletion approvals ---------------------------------------------
+
+// GET /api/admin/delete-requests?status=PENDING
+router.get(
+  "/delete-requests",
+  asyncHandler(async (req, res) => {
+    const status = req.query.status ? String(req.query.status) : "PENDING";
+    const requests = await prisma.invoiceDeleteRequest.findMany({
       where: { status },
       include: { business: { select: { name: true } } },
       orderBy: { createdAt: "desc" },
       take: 200,
     });
-    res.json({ requests, pendingCount: requests.length });
+    res.json({ requests });
+  })
+);
+
+// POST /api/admin/delete-requests/:id/approve — delete the bill (stock reversed).
+router.post(
+  "/delete-requests/:id/approve",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.invoiceDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    if (request.status !== "PENDING") throw badRequest("This request was already reviewed");
+
+    await deleteInvoiceWithReversal(request.invoiceId, request.businessId, req.auth!.userId);
+    await prisma.invoiceDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "APPROVED", reviewedAt: new Date() },
+    });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/admin/delete-requests/:id/reject — keep the bill.
+router.post(
+  "/delete-requests/:id/reject",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.invoiceDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    await prisma.invoiceDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "REJECTED", reviewedAt: new Date() },
+    });
+    res.status(204).send();
   })
 );
 

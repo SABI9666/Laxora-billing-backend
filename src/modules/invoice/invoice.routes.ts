@@ -7,6 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
+import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
 
 const router = Router();
 
@@ -151,38 +152,55 @@ router.post(
   })
 );
 
-// DELETE /api/invoices/:id — delete invoice and restore stock.
+// DELETE /api/invoices/:id — platform admins delete directly (with stock
+// reversal); shop users' deletions are held for admin approval.
 router.delete(
   "/:id",
   asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
     const invoice = await prisma.invoice.findFirst({
-      where: { id: req.params.id, businessId: req.businessId! },
-      include: { items: true },
+      where: { id: req.params.id, businessId },
+      include: { party: { select: { name: true } } },
     });
     if (!invoice) throw notFound("Invoice not found");
 
-    await prisma.$transaction(async (tx) => {
-      // Reverse the stock movement (and log the reversal) before deleting.
-      for (const l of invoice.items) {
-        if (!l.itemId) continue;
-        const wasSale = invoice.type === "SALE";
-        await recordStockMovement(tx, {
-          businessId: req.businessId!,
-          itemId: l.itemId,
-          type: wasSale ? StockMovementType.IN : StockMovementType.OUT,
-          quantity: wasSale ? Number(l.quantity) : -Number(l.quantity),
-          reason: `Reversal: deleted ${invoice.invoiceNumber}`,
-          reference: invoice.invoiceNumber,
-          createdById: req.auth!.userId,
-        });
-      }
-      // StockMovement rows reference invoices only by number, so they survive
-      // deletion as a historical record.
-      await tx.payment.deleteMany({ where: { invoiceId: invoice.id } });
-      await tx.invoice.delete({ where: { id: invoice.id } });
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth!.userId },
+      select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
 
-    res.status(204).send();
+    if (user?.isPlatformAdmin) {
+      await deleteInvoiceWithReversal(invoice.id, businessId, req.auth!.userId);
+      return res.status(204).send();
+    }
+
+    // Don't queue the same bill twice.
+    const existing = await prisma.invoiceDeleteRequest.findFirst({
+      where: { invoiceId: invoice.id, status: "PENDING" },
+    });
+    if (existing) {
+      return res.status(202).json({
+        pending: true,
+        message: "This bill is already waiting for admin approval to be deleted.",
+      });
+    }
+
+    await prisma.invoiceDeleteRequest.create({
+      data: {
+        businessId,
+        invoiceId: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        partyName: invoice.party?.name ?? null,
+        total: invoice.total,
+        requestedById: req.auth!.userId,
+        requestedByName: user?.name ?? user?.username ?? user?.email ?? null,
+      },
+    });
+
+    res.status(202).json({
+      pending: true,
+      message: "Deletion sent to the admin for approval. The bill stays until approved.",
+    });
   })
 );
 
