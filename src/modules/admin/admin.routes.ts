@@ -423,6 +423,27 @@ router.get(
   })
 );
 
+// GET /api/admin/invoices/:invoiceId — full invoice (items, party, shop) so
+// the admin can open/print any bill.
+router.get(
+  "/invoices/:invoiceId",
+  asyncHandler(async (req, res) => {
+    const invoice = await prisma.invoice.findUnique({
+      where: { id: req.params.invoiceId },
+      include: {
+        items: true,
+        party: true,
+        business: {
+          select: { name: true, gstin: true, phone: true, email: true, address: true },
+        },
+        payments: { orderBy: { paymentDate: "asc" } },
+      },
+    });
+    if (!invoice) throw notFound("Bill not found");
+    res.json({ invoice });
+  })
+);
+
 // GET /api/admin/invoices/:invoiceId/pnl — full P&L breakdown for ONE bill.
 router.get(
   "/invoices/:invoiceId/pnl",
