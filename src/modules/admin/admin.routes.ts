@@ -902,7 +902,11 @@ router.get(
   asyncHandler(async (req, res) => {
     const party = await prisma.party.findUnique({
       where: { id: req.params.partyId },
-      include: { business: { select: { name: true } } },
+      include: {
+        business: {
+          select: { name: true, gstin: true, phone: true, email: true, address: true },
+        },
+      },
     });
     if (!party) throw notFound("Party not found");
     const invoiceType = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
@@ -972,9 +976,13 @@ router.get(
         id: party.id,
         name: party.name,
         type: party.type,
+        phone: party.phone,
+        gstin: party.gstin,
+        billingAddress: party.billingAddress,
         openingBalance: round2(Number(party.openingBalance)),
         shop: party.business.name,
       },
+      business: party.business,
       closingBalance: round2(balance),
       ledger,
     });

@@ -48,6 +48,91 @@ router.get(
   })
 );
 
+// GET /api/parties/:id/ledger — statement of account for this party (scoped to
+// the active shop): bills add to what's owed, payments & returns reduce it.
+router.get(
+  "/:id/ledger",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const party = await prisma.party.findFirst({
+      where: { id: req.params.id, businessId },
+    });
+    if (!party) throw notFound("Party not found");
+    const invoiceType = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
+
+    const [invoices, payments, creditNotes] = await Promise.all([
+      prisma.invoice.findMany({
+        where: { partyId: party.id, businessId, type: invoiceType as never },
+        select: { invoiceNumber: true, invoiceDate: true, total: true },
+      }),
+      prisma.payment.findMany({
+        where: { partyId: party.id, businessId },
+        select: { paymentDate: true, amount: true, method: true },
+      }),
+      prisma.creditNote.findMany({
+        where: { partyId: party.id, businessId },
+        select: { date: true, totalAmount: true, invoiceNumber: true },
+      }),
+    ]);
+
+    type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
+    const entries: Entry[] = [];
+    for (const inv of invoices)
+      entries.push({
+        date: inv.invoiceDate,
+        kind: invoiceType === "SALE" ? "Sale Invoice" : "Purchase Invoice",
+        ref: inv.invoiceNumber,
+        debit: Number(inv.total),
+        credit: 0,
+      });
+    for (const p of payments)
+      entries.push({
+        date: p.paymentDate,
+        kind: `Payment (${p.method})`,
+        ref: "",
+        debit: 0,
+        credit: Number(p.amount),
+      });
+    for (const cn of creditNotes)
+      entries.push({
+        date: cn.date,
+        kind: "Sales Return",
+        ref: cn.invoiceNumber ?? "",
+        debit: 0,
+        credit: Number(cn.totalAmount),
+      });
+    entries.sort((a, b) => a.date.getTime() - b.date.getTime());
+
+    const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+    let balance = Number(party.openingBalance);
+    const ledger = entries.map((e) => {
+      balance += e.debit - e.credit;
+      return {
+        date: e.date,
+        kind: e.kind,
+        ref: e.ref,
+        debit: round2(e.debit),
+        credit: round2(e.credit),
+        balance: round2(balance),
+      };
+    });
+
+    res.json({
+      party: {
+        id: party.id,
+        name: party.name,
+        type: party.type,
+        phone: party.phone,
+        gstin: party.gstin,
+        billingAddress: party.billingAddress,
+        openingBalance: round2(Number(party.openingBalance)),
+      },
+      closingBalance: round2(balance),
+      ledger,
+    });
+  })
+);
+
 // POST /api/parties
 router.post(
   "/",
