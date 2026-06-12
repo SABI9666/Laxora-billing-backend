@@ -14,11 +14,16 @@ import paymentRoutes from "./modules/payment/payment.routes";
 import expenseRoutes from "./modules/expense/expense.routes";
 import dashboardRoutes from "./modules/dashboard/dashboard.routes";
 import franchiseRoutes from "./modules/franchise/franchise.routes";
+import onlineStoreRoutes from "./modules/integration/onlineStore.routes";
 
 const api = Router();
 
 // Public auth routes.
 api.use("/auth", authRoutes);
+
+// Online store integration (e-commerce website): authenticated by a per-shop
+// API key (x-api-key header) instead of a user JWT.
+api.use("/online-store", onlineStoreRoutes);
 
 // Cross-tenant admin routes: require auth + platform-admin (no tenant scoping).
 api.use("/admin", authenticate, requirePlatformAdmin, adminRoutes);

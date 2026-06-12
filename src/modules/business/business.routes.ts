@@ -1,8 +1,10 @@
+import { randomBytes } from "crypto";
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
+import { requireRole, SHOP_MANAGERS } from "../../middleware/roles";
 
 const router = Router();
 
@@ -39,6 +41,49 @@ router.put(
       data: req.body,
     });
     res.json({ business });
+  })
+);
+
+// --- Online store integration key -----------------------------------------
+// The website authenticates to /api/online-store/* with this per-shop key.
+
+// GET /api/business/online-store-key — current key (null if not connected).
+router.get(
+  "/online-store-key",
+  requireRole(...SHOP_MANAGERS),
+  asyncHandler(async (req, res) => {
+    const business = await prisma.business.findUnique({
+      where: { id: req.businessId! },
+      select: { onlineStoreApiKey: true },
+    });
+    res.json({ apiKey: business?.onlineStoreApiKey ?? null });
+  })
+);
+
+// POST /api/business/online-store-key — generate (or rotate) the key.
+router.post(
+  "/online-store-key",
+  requireRole(...SHOP_MANAGERS),
+  asyncHandler(async (req, res) => {
+    const apiKey = `lxos_${randomBytes(24).toString("hex")}`;
+    await prisma.business.update({
+      where: { id: req.businessId! },
+      data: { onlineStoreApiKey: apiKey },
+    });
+    res.json({ apiKey });
+  })
+);
+
+// DELETE /api/business/online-store-key — disconnect the online store.
+router.delete(
+  "/online-store-key",
+  requireRole(...SHOP_MANAGERS),
+  asyncHandler(async (req, res) => {
+    await prisma.business.update({
+      where: { id: req.businessId! },
+      data: { onlineStoreApiKey: null },
+    });
+    res.status(204).send();
   })
 );
 
