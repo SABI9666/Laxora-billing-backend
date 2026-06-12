@@ -72,6 +72,10 @@ model Business {
   // Next invoice numbers (simple auto-increment per business)
   nextSaleNo     Int        @default(1)
   nextPurchaseNo Int        @default(1)
+  // Online store integration: bills from the e-commerce website get their own
+  // ONL-xxxx number series, and the website authenticates with this API key.
+  nextOnlineSaleNo  Int     @default(1)
+  onlineStoreApiKey String? @unique
   // Opening balances — the cash in the shop and money in the bank when you
   // start using Laxora. The cash book builds on top of these.
   openingCash    Decimal    @default(0) @db.Decimal(14, 2)
@@ -218,6 +222,12 @@ enum InvoiceStatus {
   PAID
 }
 
+// Where the bill was made: at the counter (POS) or on the online store.
+enum InvoiceChannel {
+  POS
+  ONLINE
+}
+
 model Invoice {
   id            String        @id @default(cuid())
   businessId    String
@@ -227,6 +237,10 @@ model Invoice {
   invoiceNumber String
   type          InvoiceType   @default(SALE)
   status        InvoiceStatus @default(UNPAID)
+  channel       InvoiceChannel @default(POS)
+  // External reference for online orders (website order id) — used to make
+  // order syncing idempotent so the same order never bills twice.
+  externalRef   String?
   invoiceDate   DateTime      @default(now())
   dueDate       DateTime?
   subtotal      Decimal       @default(0) @db.Decimal(14, 2)
@@ -242,8 +256,10 @@ model Invoice {
   payments Payment[]
 
   @@unique([businessId, type, invoiceNumber])
+  @@unique([businessId, externalRef])
   @@index([businessId])
   @@index([partyId])
+  @@index([businessId, channel])
 }
 
 model InvoiceItem {

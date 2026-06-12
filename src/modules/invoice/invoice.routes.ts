@@ -31,17 +31,18 @@ const invoiceSchema = z.object({
 
 const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-// GET /api/invoices?type=SALE&partyId=&status=
+// GET /api/invoices?type=SALE&partyId=&status=&channel=ONLINE
 router.get(
   "/",
   asyncHandler(async (req, res) => {
-    const { type, partyId, status } = req.query;
+    const { type, partyId, status, channel } = req.query;
     const invoices = await prisma.invoice.findMany({
       where: {
         businessId: req.businessId!,
         ...(type ? { type: type as "SALE" | "PURCHASE" } : {}),
         ...(partyId ? { partyId: String(partyId) } : {}),
         ...(status ? { status: status as never } : {}),
+        ...(channel ? { channel: channel as "POS" | "ONLINE" } : {}),
       },
       include: { party: { select: { id: true, name: true } } },
       orderBy: { createdAt: "desc" },
