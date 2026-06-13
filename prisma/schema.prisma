@@ -160,6 +160,12 @@ model Category {
   businessId String
   business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
   name       String
+  // Optional parent for a two-level tree: a top-level "main category" has no
+  // parent; a "subcategory" points to its main category. Mirrors the website's
+  // main-category / subcategory structure.
+  parentId   String?
+  parent     Category?  @relation("CategoryTree", fields: [parentId], references: [id], onDelete: Cascade)
+  children   Category[] @relation("CategoryTree")
   createdAt  DateTime @default(now())
   updatedAt  DateTime @updatedAt
 
@@ -167,6 +173,7 @@ model Category {
 
   @@unique([businessId, name])
   @@index([businessId])
+  @@index([parentId])
 }
 
 // ----------------------------------------------------------------------------
@@ -189,12 +196,21 @@ model Item {
   wattage       String?
   hsn           String?
   unit          String    @default("PCS")
-  salePrice     Decimal   @default(0) @db.Decimal(14, 2) // MRP / sale price
+  salePrice     Decimal   @default(0) @db.Decimal(14, 2) // selling price online & in shop
+  mrp           Decimal   @default(0) @db.Decimal(14, 2) // strike-through / original price
   purchasePrice Decimal   @default(0) @db.Decimal(14, 2)
   taxRate       Decimal   @default(0) @db.Decimal(5, 2)
   stockQty      Decimal   @default(0) @db.Decimal(14, 3)
   lowStockAlert Decimal   @default(0) @db.Decimal(14, 3) // reorder level
   isService     Boolean   @default(false)
+  // Online store / website fields — let the shop manage a product's web
+  // listing (description + up to three images) right here in billing.
+  description   String?
+  imageUrl      String?
+  imageUrl2     String?
+  imageUrl3     String?
+  // When true, this product is shown on the Laxorashopping website.
+  publishOnline Boolean   @default(false)
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -205,6 +221,7 @@ model Item {
   @@index([categoryId])
   @@index([supplierId])
   @@index([businessId, barcode])
+  @@index([businessId, publishOnline])
 }
 
 // ----------------------------------------------------------------------------
