@@ -143,8 +143,9 @@ router.put(
       select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
 
-    // Platform admins apply changes immediately.
-    if (user?.isPlatformAdmin) {
+    // Platform admins and the shop's OWNER apply changes immediately; other
+    // roles' edits are held for admin approval.
+    if (user?.isPlatformAdmin || req.memberRole === "OWNER") {
       const item = await prisma.item.update({
         where: { id: req.params.id },
         data: req.body,
