@@ -1,4 +1,6 @@
 import { Router } from "express";
+import multer from "multer";
+import { Storage } from "@google-cloud/storage";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
@@ -7,6 +9,16 @@ import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, SHOP_MANAGERS } from "../../middleware/roles";
 
 const router = Router();
+
+// Product image upload: stores the file in a Google Cloud Storage bucket
+// (in this project) and returns its public URL. The bucket name comes from the
+// GCS_BUCKET env var; on Cloud Run the ambient service account is used.
+const gcsBucket = process.env.GCS_BUCKET || "";
+const gcs = new Storage();
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 6 * 1024 * 1024 }, // 6 MB
+});
 
 const itemSchema = z.object({
   name: z.string().min(1),
@@ -41,6 +53,40 @@ async function assertCategory(businessId: string, categoryId?: string | null) {
   });
   if (!category) throw badRequest("Invalid categoryId for this shop");
 }
+
+// POST /api/items/upload-image — multipart upload of one product image.
+router.post(
+  "/upload-image",
+  requireRole(...SHOP_MANAGERS),
+  upload.single("file"),
+  asyncHandler(async (req, res) => {
+    if (!gcsBucket)
+      throw badRequest(
+        "Image storage is not configured. Set the GCS_BUCKET env var on the backend."
+      );
+    const file = (req as unknown as { file?: Express.Multer.File }).file;
+    if (!file) throw badRequest("No image file received");
+    if (!file.mimetype.startsWith("image/"))
+      throw badRequest("Only image files can be uploaded");
+
+    const ext = (file.originalname.split(".").pop() || "jpg")
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, "")
+      .slice(0, 5);
+    const objectName = `product-images/${req.businessId}/${Date.now()}-${Math.random()
+      .toString(36)
+      .slice(2)}.${ext}`;
+
+    const blob = gcs.bucket(gcsBucket).file(objectName);
+    await blob.save(file.buffer, {
+      contentType: file.mimetype,
+      resumable: false,
+      metadata: { cacheControl: "public, max-age=31536000" },
+    });
+
+    res.json({ url: `https://storage.googleapis.com/${gcsBucket}/${objectName}` });
+  })
+);
 
 // GET /api/items?search=&categoryId=&lowStock=true&barcode=
 router.get(
@@ -143,8 +189,9 @@ router.put(
       select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
 
-    // Platform admins apply changes immediately.
-    if (user?.isPlatformAdmin) {
+    // Platform admins and the shop's OWNER apply changes immediately; other
+    // roles' edits are held for admin approval.
+    if (user?.isPlatformAdmin || req.memberRole === "OWNER") {
       const item = await prisma.item.update({
         where: { id: req.params.id },
         data: req.body,
