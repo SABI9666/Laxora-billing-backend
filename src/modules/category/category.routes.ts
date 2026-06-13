@@ -11,16 +11,32 @@ const router = Router();
 
 const categorySchema = z.object({
   name: z.string().min(1),
+  // Optional parent category id — set it to make this a subcategory.
+  parentId: z.string().optional().nullable(),
 });
 
-// GET /api/categories — list categories (with item counts) for the shop.
+// Verifies a parentId (if given) is a top-level category of this shop, so we
+// only ever build a two-level tree (main category → subcategory).
+async function assertParent(businessId: string, parentId?: string | null) {
+  if (!parentId) return;
+  const parent = await prisma.category.findFirst({
+    where: { id: parentId, businessId },
+  });
+  if (!parent) throw badRequest("Invalid parent category for this shop");
+  if (parent.parentId) throw badRequest("Subcategories can only be one level deep");
+}
+
+// GET /api/categories — list categories (with item counts + parent) for the shop.
 router.get(
   "/",
   asyncHandler(async (req, res) => {
     const categories = await prisma.category.findMany({
       where: { businessId: req.businessId! },
       orderBy: { name: "asc" },
-      include: { _count: { select: { items: true } } },
+      include: {
+        _count: { select: { items: true } },
+        parent: { select: { id: true, name: true } },
+      },
     });
     res.json({ categories });
   })
@@ -32,9 +48,14 @@ router.post(
   requireRole(...SHOP_MANAGERS),
   validateBody(categorySchema),
   asyncHandler(async (req, res) => {
+    await assertParent(req.businessId!, req.body.parentId);
     try {
       const category = await prisma.category.create({
-        data: { name: req.body.name, businessId: req.businessId! },
+        data: {
+          name: req.body.name,
+          parentId: req.body.parentId || null,
+          businessId: req.businessId!,
+        },
       });
       res.status(201).json({ category });
     } catch (e) {
@@ -56,9 +77,17 @@ router.put(
       where: { id: req.params.id, businessId: req.businessId! },
     });
     if (!existing) throw notFound("Category not found");
+    if (req.body.parentId !== undefined) {
+      if (req.body.parentId === req.params.id)
+        throw badRequest("A category cannot be its own parent");
+      await assertParent(req.businessId!, req.body.parentId);
+    }
     const category = await prisma.category.update({
       where: { id: req.params.id },
-      data: req.body,
+      data: {
+        ...(req.body.name !== undefined ? { name: req.body.name } : {}),
+        ...(req.body.parentId !== undefined ? { parentId: req.body.parentId || null } : {}),
+      },
     });
     res.json({ category });
   })

@@ -61,6 +61,45 @@ router.get(
   })
 );
 
+// GET /api/online-store/catalog — full listing of products the shop has
+// chosen to publish online (publishOnline = true), with images and the
+// main-category / subcategory names, so the website can render them.
+router.get(
+  "/catalog",
+  asyncHandler(async (req, res) => {
+    const items = await prisma.item.findMany({
+      where: { businessId: req.businessId!, isService: false, publishOnline: true },
+      include: { category: { select: { name: true, parent: { select: { name: true } } } } },
+      orderBy: { name: "asc" },
+    });
+    res.json({
+      products: items.map((i) => {
+        // If the item's category has a parent, the parent is the main category
+        // and the category itself is the subcategory; otherwise it's a main
+        // category with no subcategory.
+        const mainCategory = i.category?.parent?.name ?? i.category?.name ?? null;
+        const subcategory = i.category?.parent ? i.category?.name ?? null : null;
+        return {
+          id: i.id,
+          name: i.name,
+          description: i.description ?? "",
+          sku: i.sku ?? null,
+          barcode: i.barcode ?? null,
+          price: Number(i.salePrice),
+          mrp: Number(i.mrp) || null,
+          stockQty: Number(i.stockQty),
+          unit: i.unit,
+          mainCategory,
+          subcategory,
+          imageUrl: i.imageUrl ?? null,
+          imageUrl2: i.imageUrl2 ?? null,
+          imageUrl3: i.imageUrl3 ?? null,
+        };
+      }),
+    });
+  })
+);
+
 const orderSchema = z.object({
   // Website order id (or payment id) — makes order syncing idempotent.
   orderRef: z.string().min(1),

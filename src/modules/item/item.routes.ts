@@ -19,11 +19,18 @@ const itemSchema = z.object({
   hsn: z.string().optional(),
   unit: z.string().default("PCS"),
   salePrice: z.number().nonnegative().default(0),
+  mrp: z.number().nonnegative().default(0),
   purchasePrice: z.number().nonnegative().default(0),
   taxRate: z.number().min(0).max(100).default(0),
   stockQty: z.number().default(0),
   lowStockAlert: z.number().default(0),
   isService: z.boolean().default(false),
+  // Online store / website listing fields.
+  description: z.string().optional().nullable(),
+  imageUrl: z.string().optional().nullable(),
+  imageUrl2: z.string().optional().nullable(),
+  imageUrl3: z.string().optional().nullable(),
+  publishOnline: z.boolean().default(false),
 });
 
 // Ensures a categoryId (if provided) belongs to the active shop.
@@ -56,7 +63,7 @@ router.get(
         ...(categoryId ? { categoryId: String(categoryId) } : {}),
         ...(barcode ? { barcode: String(barcode) } : {}),
       },
-      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true, parentId: true } }, supplier: { select: { id: true, name: true } } },
       orderBy: { name: "asc" },
     });
 
@@ -84,7 +91,7 @@ router.get(
         ...(barcode ? { barcode: String(barcode) } : {}),
         ...(sku ? { sku: String(sku) } : {}),
       },
-      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true, parentId: true } }, supplier: { select: { id: true, name: true } } },
     });
     if (!item) throw notFound("No item matches that code");
     res.json({ item });
@@ -97,7 +104,7 @@ router.get(
   asyncHandler(async (req, res) => {
     const item = await prisma.item.findFirst({
       where: { id: req.params.id, businessId: req.businessId! },
-      include: { category: { select: { id: true, name: true } }, supplier: { select: { id: true, name: true } } },
+      include: { category: { select: { id: true, name: true, parentId: true } }, supplier: { select: { id: true, name: true } } },
     });
     if (!item) throw notFound("Item not found");
     res.json({ item });
