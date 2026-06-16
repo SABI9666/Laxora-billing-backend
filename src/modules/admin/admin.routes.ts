@@ -661,7 +661,41 @@ router.get(
     if (from) saleCond.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
     if (to) saleCond.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
 
-    const [suppliers, purchaseRows, salesRows, itemCountRows, stockRows] = await Promise.all([
+    // Payments made to suppliers (money out) in the period.
+    const payCond = [
+      Prisma.sql`"businessId" = ${id}`,
+      Prisma.sql`direction = 'OUT'`,
+      Prisma.sql`"partyId" IS NOT NULL`,
+    ];
+    if (from) payCond.push(Prisma.sql`"paymentDate" >= ${from}`);
+    if (to) payCond.push(Prisma.sql`"paymentDate" <= ${to}`);
+
+    // Stock movements of suppliers' products in the period (how fast they move).
+    const moveCond = [
+      Prisma.sql`i."businessId" = ${id}`,
+      Prisma.sql`i."supplierId" IS NOT NULL`,
+    ];
+    if (from) moveCond.push(Prisma.sql`sm."createdAt" >= ${from}`);
+    if (to) moveCond.push(Prisma.sql`sm."createdAt" <= ${to}`);
+
+    // Per-item OUT total within the period — used to flag idle (no-sale) stock.
+    const outRange = (() => {
+      const c = [Prisma.sql`sm."itemId" = i.id`, Prisma.sql`sm.quantity < 0`];
+      if (from) c.push(Prisma.sql`sm."createdAt" >= ${from}`);
+      if (to) c.push(Prisma.sql`sm."createdAt" <= ${to}`);
+      return Prisma.join(c, " AND ");
+    })();
+
+    const [
+      suppliers,
+      purchaseRows,
+      salesRows,
+      itemCountRows,
+      stockRows,
+      payRows,
+      moveRows,
+      idleRows,
+    ] = await Promise.all([
       prisma.party.findMany({
         where: { businessId: id, type: "SUPPLIER" },
         select: { id: true, name: true, phone: true },
@@ -697,6 +731,33 @@ router.get(
         WHERE i."businessId" = ${id} AND i."supplierId" IS NOT NULL AND i."isService" = false
         GROUP BY 1
       `),
+      // Cash paid to each supplier in the period.
+      prisma.$queryRaw<Array<{ sid: string; paid: number }>>(Prisma.sql`
+        SELECT "partyId" AS sid, COALESCE(SUM(amount), 0)::float AS paid
+        FROM "Payment" WHERE ${Prisma.join(payCond, " AND ")} GROUP BY 1
+      `),
+      // Units received / sold of each supplier's products in the period.
+      prisma.$queryRaw<Array<{ sid: string; inunits: number; outunits: number }>>(Prisma.sql`
+        SELECT i."supplierId" AS sid,
+               COALESCE(SUM(sm.quantity) FILTER (WHERE sm.quantity > 0), 0)::float AS inunits,
+               COALESCE(SUM(-sm.quantity) FILTER (WHERE sm.quantity < 0), 0)::float AS outunits
+        FROM "StockMovement" sm JOIN "Item" i ON i.id = sm."itemId"
+        WHERE ${Prisma.join(moveCond, " AND ")} GROUP BY 1
+      `),
+      // Idle stock per supplier: products still on hand that had NO sale/issue
+      // in the period — dead money sitting on the shelf.
+      prisma.$queryRaw<Array<{ sid: string; idleval: number; idlecnt: number }>>(Prisma.sql`
+        SELECT i."supplierId" AS sid,
+               COALESCE(SUM(CASE WHEN COALESCE(o.outq, 0) = 0 AND i."stockQty" > 0
+                                 THEN i."stockQty" * i."purchasePrice" ELSE 0 END), 0)::float AS idleval,
+               COUNT(*) FILTER (WHERE COALESCE(o.outq, 0) = 0 AND i."stockQty" > 0)::int AS idlecnt
+        FROM "Item" i
+        LEFT JOIN LATERAL (
+          SELECT SUM(-sm.quantity) AS outq FROM "StockMovement" sm WHERE ${outRange}
+        ) o ON true
+        WHERE i."businessId" = ${id} AND i."supplierId" IS NOT NULL AND i."isService" = false
+        GROUP BY 1
+      `),
     ]);
 
     const inMap = new Map(purchaseRows.map((r) => [r.sid, Number(r.inval)]));
@@ -705,21 +766,38 @@ router.get(
     );
     const cntMap = new Map(itemCountRows.map((r) => [r.sid, Number(r.cnt)]));
     const stockMap = new Map(stockRows.map((r) => [r.sid, Number(r.value)]));
+    const payMap = new Map(payRows.map((r) => [r.sid, Number(r.paid)]));
+    const moveMap = new Map(
+      moveRows.map((r) => [r.sid, { in: Number(r.inunits), out: Number(r.outunits) }])
+    );
+    const idleMap = new Map(
+      idleRows.map((r) => [r.sid, { val: Number(r.idleval), cnt: Number(r.idlecnt) }])
+    );
 
     const rows = suppliers
       .map((s) => {
         const purchaseIn = inMap.get(s.id) ?? 0;
         const so = outMap.get(s.id) ?? { out: 0, cogs: 0 };
         const profit = so.out - so.cogs;
+        const mv = moveMap.get(s.id) ?? { in: 0, out: 0 };
+        const idle = idleMap.get(s.id) ?? { val: 0, cnt: 0 };
+        const paid = payMap.get(s.id) ?? 0;
         return {
           id: s.id,
           name: s.name,
           phone: s.phone,
           purchaseIn: round2(purchaseIn),
+          paidInPeriod: round2(paid),
+          // Credit taken this period = bought now, not yet paid (adds to payable).
+          payableDelta: round2(purchaseIn - paid),
           salesOut: round2(so.out),
           cogs: round2(so.cogs),
           profit: round2(profit),
           marginPct: so.out ? round2((profit / so.out) * 100) : 0,
+          unitsIn: round2(mv.in),
+          unitsOut: round2(mv.out),
+          idleValue: round2(idle.val),
+          idleCount: idle.cnt,
           productCount: cntMap.get(s.id) ?? 0,
           stockValue: round2(stockMap.get(s.id) ?? 0),
         };
@@ -727,9 +805,38 @@ router.get(
       .sort((a, b) => b.profit - a.profit);
 
     const best = rows.find((r) => r.profit > 0) ?? null;
+    // Fastest-moving supplier = most units of their products sold in the period.
+    const movers = rows.filter((r) => r.unitsOut > 0);
+    const fastest = movers.length
+      ? movers.reduce((a, b) => (b.unitsOut > a.unitsOut ? b : a))
+      : null;
+    // Most idle supplier = highest value of unsold stock sitting on the shelf.
+    const idlers = rows
+      .filter((r) => r.idleValue > 0)
+      .sort((a, b) => b.idleValue - a.idleValue);
+    const mostIdle = idlers[0] ?? null;
+
+    const cashFlow = {
+      purchased: round2(rows.reduce((s, r) => s + r.purchaseIn, 0)),
+      paid: round2(rows.reduce((s, r) => s + r.paidInPeriod, 0)),
+      stockValue: round2(rows.reduce((s, r) => s + r.stockValue, 0)),
+      idleValue: round2(rows.reduce((s, r) => s + r.idleValue, 0)),
+      payableDelta: round2(
+        rows.reduce((s, r) => s + r.purchaseIn, 0) -
+          rows.reduce((s, r) => s + r.paidInPeriod, 0)
+      ),
+    };
+
     res.json({
       suppliers: rows,
       best: best ? { name: best.name, profit: best.profit, marginPct: best.marginPct } : null,
+      fastest: fastest
+        ? { name: fastest.name, unitsOut: fastest.unitsOut, salesOut: fastest.salesOut }
+        : null,
+      mostIdle: mostIdle
+        ? { name: mostIdle.name, idleValue: mostIdle.idleValue, idleCount: mostIdle.idleCount }
+        : null,
+      cashFlow,
     });
   })
 );
