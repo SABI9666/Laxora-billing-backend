@@ -776,12 +776,14 @@ router.get(
         onhand: number;
         inqty: number;
         outqty: number;
+        createdat: Date;
         firstin: Date | null;
         lastin: Date | null;
         lastout: Date | null;
       }>
     >(Prisma.sql`
       SELECT i.id, i.name, i.sku, i.brand, i.unit,
+             i."createdAt" AS createdat,
              i."purchasePrice"::float AS purchaseprice,
              i."salePrice"::float AS saleprice,
              i."lowStockAlert"::float AS lowalert,
@@ -811,7 +813,10 @@ router.get(
     const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
 
     const items = rows.map((r) => {
-      const firstIn = r.firstin ? new Date(r.firstin) : null;
+      // Entry date: the first stock-in from the ledger, falling back to when
+      // the product was created (covers products added before opening stock was
+      // logged automatically). So every product always has an entry date.
+      const firstIn = r.firstin ? new Date(r.firstin) : new Date(r.createdat);
       const lastIn = r.lastin ? new Date(r.lastin) : null;
       const lastOut = r.lastout ? new Date(r.lastout) : null;
       const onHand = round2(Number(r.onhand));
@@ -819,12 +824,10 @@ router.get(
       const outQty = round2(Number(r.outqty));
       const value = round2(onHand * Number(r.purchaseprice));
       // How long the product has existed, and how long since it last moved out.
-      const ageDays = firstIn ? daysBetween(firstIn, asOf) : null;
+      const ageDays = daysBetween(firstIn, asOf);
       const stockedDays = lastOut
         ? daysBetween(lastOut, asOf)
-        : firstIn
-        ? daysBetween(firstIn, asOf)
-        : null;
+        : daysBetween(firstIn, asOf);
       // Average daily out over the active window → days of cover left (DIO).
       const windowStart = from ?? firstIn ?? asOf;
       const windowDays = Math.max(1, daysBetween(windowStart, asOf));
@@ -885,6 +888,39 @@ router.get(
       slowMoving,
       items,
     });
+  })
+);
+
+// POST /api/admin/stock/backfill-entry-dates — one-click, idempotent backfill:
+// for every in-stock, non-service product that has no inward (entry) movement
+// yet, insert an "Opening stock" IN movement dated today so it gets an entry
+// date. Products added after auto-logging already have one and are skipped.
+router.post(
+  "/stock/backfill-entry-dates",
+  asyncHandler(async (_req, res) => {
+    const today = new Date();
+    const products = await prisma.item.findMany({
+      where: {
+        isService: false,
+        stockQty: { gt: 0 },
+        stockMovements: { none: { quantity: { gt: 0 } } },
+      },
+      select: { id: true, businessId: true, stockQty: true },
+    });
+    if (products.length > 0) {
+      await prisma.stockMovement.createMany({
+        data: products.map((p) => ({
+          businessId: p.businessId,
+          itemId: p.id,
+          type: "IN" as const,
+          quantity: p.stockQty,
+          balanceAfter: p.stockQty,
+          reason: "Opening stock (backfilled)",
+          createdAt: today,
+        })),
+      });
+    }
+    res.json({ backfilled: products.length, date: today });
   })
 );
 
