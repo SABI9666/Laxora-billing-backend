@@ -734,6 +734,223 @@ router.get(
   })
 );
 
+// GET /api/admin/businesses/:id/stock-movement?from=&to= — the material
+// movement register for a shop: for every product, how much came IN and went
+// OUT in the period, what is on hand now (as of the "To" date), the date of
+// first entry / last entry / last exit, how many days it has been sitting since
+// it last moved, and how many days of cover the current stock gives at the
+// recent sales pace. The response also calls out the fastest-moving products
+// and the ones that have sat in stock the longest.
+router.get(
+  "/businesses/:id/stock-movement",
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const business = await prisma.business.findUnique({
+      where: { id },
+      select: { name: true },
+    });
+    if (!business) throw notFound("Shop not found");
+
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined;
+
+    // Range filter for the in/out totals. Entry/exit dates are tracked across
+    // all time so "date of entry / exit" stays meaningful regardless of range.
+    const rangeCond = (signFilter: ReturnType<typeof Prisma.sql>) => {
+      const conds = [Prisma.sql`sm."itemId" = i.id`, signFilter];
+      if (from) conds.push(Prisma.sql`sm."createdAt" >= ${from}`);
+      if (to) conds.push(Prisma.sql`sm."createdAt" <= ${to}`);
+      return Prisma.join(conds, " AND ");
+    };
+
+    const rows = await prisma.$queryRaw<
+      Array<{
+        id: string;
+        name: string;
+        sku: string | null;
+        brand: string | null;
+        unit: string;
+        purchaseprice: number;
+        saleprice: number;
+        lowalert: number;
+        onhand: number;
+        inqty: number;
+        outqty: number;
+        firstin: Date | null;
+        lastin: Date | null;
+        lastout: Date | null;
+      }>
+    >(Prisma.sql`
+      SELECT i.id, i.name, i.sku, i.brand, i.unit,
+             i."purchasePrice"::float AS purchaseprice,
+             i."salePrice"::float AS saleprice,
+             i."lowStockAlert"::float AS lowalert,
+             (i."stockQty" - ${
+               to
+                 ? Prisma.sql`COALESCE((SELECT SUM(quantity) FROM "StockMovement" sm WHERE sm."itemId" = i.id AND sm."createdAt" > ${to}), 0)`
+                 : Prisma.sql`0`
+             })::float AS onhand,
+             COALESCE((SELECT SUM(quantity) FROM "StockMovement" sm WHERE ${rangeCond(
+               Prisma.sql`quantity > 0`
+             )}), 0)::float AS inqty,
+             COALESCE((SELECT SUM(-quantity) FROM "StockMovement" sm WHERE ${rangeCond(
+               Prisma.sql`quantity < 0`
+             )}), 0)::float AS outqty,
+             (SELECT MIN("createdAt") FROM "StockMovement" sm WHERE sm."itemId" = i.id AND quantity > 0) AS firstin,
+             (SELECT MAX("createdAt") FROM "StockMovement" sm WHERE sm."itemId" = i.id AND quantity > 0) AS lastin,
+             (SELECT MAX("createdAt") FROM "StockMovement" sm WHERE sm."itemId" = i.id AND quantity < 0) AS lastout
+      FROM "Item" i
+      WHERE i."businessId" = ${id} AND i."isService" = false
+      ORDER BY i.name ASC
+    `);
+
+    const dayMs = 86_400_000;
+    const asOf = to ?? new Date();
+    const daysBetween = (a: Date, b: Date) =>
+      Math.max(0, Math.round((b.getTime() - a.getTime()) / dayMs));
+    const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
+
+    const items = rows.map((r) => {
+      const firstIn = r.firstin ? new Date(r.firstin) : null;
+      const lastIn = r.lastin ? new Date(r.lastin) : null;
+      const lastOut = r.lastout ? new Date(r.lastout) : null;
+      const onHand = round2(Number(r.onhand));
+      const inQty = round2(Number(r.inqty));
+      const outQty = round2(Number(r.outqty));
+      const value = round2(onHand * Number(r.purchaseprice));
+      // How long the product has existed, and how long since it last moved out.
+      const ageDays = firstIn ? daysBetween(firstIn, asOf) : null;
+      const stockedDays = lastOut
+        ? daysBetween(lastOut, asOf)
+        : firstIn
+        ? daysBetween(firstIn, asOf)
+        : null;
+      // Average daily out over the active window → days of cover left (DIO).
+      const windowStart = from ?? firstIn ?? asOf;
+      const windowDays = Math.max(1, daysBetween(windowStart, asOf));
+      const velocity = outQty / windowDays; // units sold per day
+      const daysCover = velocity > 0 ? Math.round(onHand / velocity) : null;
+      return {
+        id: r.id,
+        name: r.name,
+        sku: r.sku,
+        brand: r.brand,
+        unit: r.unit,
+        purchasePrice: round2(Number(r.purchaseprice)),
+        salePrice: round2(Number(r.saleprice)),
+        onHand,
+        inQty,
+        outQty,
+        inValue: round2(inQty * Number(r.purchaseprice)),
+        outValue: round2(outQty * Number(r.purchaseprice)),
+        value,
+        firstIn,
+        lastIn,
+        lastOut,
+        ageDays,
+        stockedDays,
+        daysCover,
+        velocity: round3(velocity),
+        low: onHand <= Number(r.lowalert),
+        idle: !!stockedDays && stockedDays >= 90 && onHand > 0,
+      };
+    });
+
+    // Fastest moving = most units sold out in the period. Most days in stock =
+    // products still on hand that have sat the longest since they last moved.
+    const fastMoving = items
+      .filter((i) => i.outQty > 0)
+      .sort((a, b) => b.outQty - a.outQty)
+      .slice(0, 5);
+    const slowMoving = items
+      .filter((i) => i.onHand > 0 && i.stockedDays != null)
+      .sort((a, b) => (b.stockedDays ?? 0) - (a.stockedDays ?? 0))
+      .slice(0, 5);
+
+    res.json({
+      shop: business.name,
+      asOf,
+      period: { from: from ?? null, to: to ?? null },
+      totals: {
+        products: items.length,
+        stockValue: round2(items.reduce((s, i) => s + i.value, 0)),
+        inQty: round2(items.reduce((s, i) => s + i.inQty, 0)),
+        outQty: round2(items.reduce((s, i) => s + i.outQty, 0)),
+        inValue: round2(items.reduce((s, i) => s + i.inValue, 0)),
+        outValue: round2(items.reduce((s, i) => s + i.outValue, 0)),
+        lowStock: items.filter((i) => i.low).length,
+        idle: items.filter((i) => i.idle).length,
+      },
+      fastMoving,
+      slowMoving,
+      items,
+    });
+  })
+);
+
+// GET /api/admin/items/:itemId/movements?from=&to= — the full entry/exit
+// timeline for ONE product, with the running on-hand balance after each move.
+router.get(
+  "/items/:itemId/movements",
+  asyncHandler(async (req, res) => {
+    const item = await prisma.item.findUnique({
+      where: { id: req.params.itemId },
+      include: {
+        business: { select: { name: true } },
+        supplier: { select: { name: true } },
+      },
+    });
+    if (!item) throw notFound("Product not found");
+
+    const from = req.query.from ? new Date(String(req.query.from)) : undefined;
+    const to = req.query.to ? new Date(String(req.query.to)) : undefined;
+
+    const movements = await prisma.stockMovement.findMany({
+      where: {
+        itemId: item.id,
+        ...(from || to
+          ? { createdAt: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } }
+          : {}),
+      },
+      orderBy: { createdAt: "desc" },
+      take: 500,
+    });
+
+    const inQty = movements
+      .filter((m) => Number(m.quantity) > 0)
+      .reduce((s, m) => s + Number(m.quantity), 0);
+    const outQty = movements
+      .filter((m) => Number(m.quantity) < 0)
+      .reduce((s, m) => s - Number(m.quantity), 0);
+
+    res.json({
+      item: {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        unit: item.unit,
+        brand: item.brand,
+        stockQty: round2(Number(item.stockQty)),
+        purchasePrice: round2(Number(item.purchasePrice)),
+        salePrice: round2(Number(item.salePrice)),
+        shop: item.business.name,
+        supplier: item.supplier?.name ?? null,
+      },
+      summary: { inQty: round2(inQty), outQty: round2(outQty), count: movements.length },
+      movements: movements.map((m) => ({
+        id: m.id,
+        type: m.type,
+        quantity: round2(Number(m.quantity)),
+        balanceAfter: round2(Number(m.balanceAfter)),
+        reason: m.reason,
+        reference: m.reference,
+        invoiceId: m.invoiceId,
+        date: m.createdAt,
+      })),
+    });
+  })
+);
+
 // GET /api/admin/parties/:partyId/stock?from=&to= — all stock items supplied
 // by this supplier. Stock value is as of the "To" date; stock in/out are the
 // movements within the date range.
