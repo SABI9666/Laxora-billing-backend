@@ -164,8 +164,29 @@ router.post(
   validateBody(itemSchema),
   asyncHandler(async (req, res) => {
     await assertCategory(req.businessId!, req.body.categoryId);
-    const item = await prisma.item.create({
-      data: { ...req.body, businessId: req.businessId! },
+    const openingQty = req.body.isService ? 0 : Number(req.body.stockQty) || 0;
+    const item = await prisma.$transaction(async (tx) => {
+      const created = await tx.item.create({
+        data: { ...req.body, businessId: req.businessId! },
+      });
+      // Record the opening stock as the product's first entry, so its entry
+      // date is captured automatically in the stock ledger (the item is
+      // created with the opening quantity already set, so we log the movement
+      // directly rather than incrementing it again).
+      if (openingQty > 0) {
+        await tx.stockMovement.create({
+          data: {
+            businessId: req.businessId!,
+            itemId: created.id,
+            type: "IN",
+            quantity: created.stockQty,
+            balanceAfter: created.stockQty,
+            reason: "Opening stock",
+            createdById: req.auth!.userId,
+          },
+        });
+      }
+      return created;
     });
     res.status(201).json({ item });
   })

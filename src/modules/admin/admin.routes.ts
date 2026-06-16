@@ -776,12 +776,14 @@ router.get(
         onhand: number;
         inqty: number;
         outqty: number;
+        createdat: Date;
         firstin: Date | null;
         lastin: Date | null;
         lastout: Date | null;
       }>
     >(Prisma.sql`
       SELECT i.id, i.name, i.sku, i.brand, i.unit,
+             i."createdAt" AS createdat,
              i."purchasePrice"::float AS purchaseprice,
              i."salePrice"::float AS saleprice,
              i."lowStockAlert"::float AS lowalert,
@@ -811,7 +813,10 @@ router.get(
     const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
 
     const items = rows.map((r) => {
-      const firstIn = r.firstin ? new Date(r.firstin) : null;
+      // Entry date: the first stock-in from the ledger, falling back to when
+      // the product was created (covers products added before opening stock was
+      // logged automatically). So every product always has an entry date.
+      const firstIn = r.firstin ? new Date(r.firstin) : new Date(r.createdat);
       const lastIn = r.lastin ? new Date(r.lastin) : null;
       const lastOut = r.lastout ? new Date(r.lastout) : null;
       const onHand = round2(Number(r.onhand));
@@ -819,12 +824,10 @@ router.get(
       const outQty = round2(Number(r.outqty));
       const value = round2(onHand * Number(r.purchaseprice));
       // How long the product has existed, and how long since it last moved out.
-      const ageDays = firstIn ? daysBetween(firstIn, asOf) : null;
+      const ageDays = daysBetween(firstIn, asOf);
       const stockedDays = lastOut
         ? daysBetween(lastOut, asOf)
-        : firstIn
-        ? daysBetween(firstIn, asOf)
-        : null;
+        : daysBetween(firstIn, asOf);
       // Average daily out over the active window → days of cover left (DIO).
       const windowStart = from ?? firstIn ?? asOf;
       const windowDays = Math.max(1, daysBetween(windowStart, asOf));
