@@ -526,8 +526,9 @@ router.get(
   })
 );
 
-// GET /api/admin/businesses/:id/sales-report?from=&to= — sales totals broken
-// down by month, for the selected date range.
+// GET /api/admin/businesses/:id/sales-report?from=&to=&groupBy=month|quarter|year
+// Sales totals split by sales channel (retail/POS vs online) and grouped by the
+// chosen period.
 router.get(
   "/businesses/:id/sales-report",
   asyncHandler(async (req, res) => {
@@ -538,7 +539,19 @@ router.get(
     });
     if (!business) throw notFound("Shop not found");
 
-    const { from, to, filter } = dateRange(req);
+    const { from, to } = dateRange(req);
+
+    // Period grouping: month (default), quarter or year.
+    const groupByRaw = String(req.query.groupBy ?? "month").toLowerCase();
+    const groupBy = ["month", "quarter", "year"].includes(groupByRaw)
+      ? groupByRaw
+      : "month";
+    const labelExpr =
+      groupBy === "year"
+        ? Prisma.sql`to_char(date_trunc('year', "invoiceDate"), 'YYYY')`
+        : groupBy === "quarter"
+        ? Prisma.sql`to_char(date_trunc('quarter', "invoiceDate"), 'YYYY-"Q"Q')`
+        : Prisma.sql`to_char(date_trunc('month', "invoiceDate"), 'YYYY-MM')`;
 
     const conditions = [
       Prisma.sql`"businessId" = ${id}`,
@@ -547,38 +560,81 @@ router.get(
     if (from) conditions.push(Prisma.sql`"invoiceDate" >= ${from}`);
     if (to) conditions.push(Prisma.sql`"invoiceDate" <= ${to}`);
 
-    const months = await prisma.$queryRaw<
-      Array<{ month: string; count: number; total: number; tax: number }>
+    const rows = await prisma.$queryRaw<
+      Array<{
+        period: string;
+        count: number;
+        total: number;
+        tax: number;
+        online_count: number;
+        online_total: number;
+        online_tax: number;
+        pos_count: number;
+        pos_total: number;
+        pos_tax: number;
+      }>
     >(Prisma.sql`
-      SELECT to_char(date_trunc('month', "invoiceDate"), 'YYYY-MM') AS month,
+      SELECT ${labelExpr} AS period,
              COUNT(*)::int AS count,
              COALESCE(SUM(total), 0)::float AS total,
-             COALESCE(SUM("taxAmount"), 0)::float AS tax
+             COALESCE(SUM("taxAmount"), 0)::float AS tax,
+             COUNT(*) FILTER (WHERE channel = 'ONLINE')::int AS online_count,
+             COALESCE(SUM(total) FILTER (WHERE channel = 'ONLINE'), 0)::float AS online_total,
+             COALESCE(SUM("taxAmount") FILTER (WHERE channel = 'ONLINE'), 0)::float AS online_tax,
+             COUNT(*) FILTER (WHERE channel = 'POS')::int AS pos_count,
+             COALESCE(SUM(total) FILTER (WHERE channel = 'POS'), 0)::float AS pos_total,
+             COALESCE(SUM("taxAmount") FILTER (WHERE channel = 'POS'), 0)::float AS pos_tax
       FROM "Invoice"
       WHERE ${Prisma.join(conditions, " AND ")}
       GROUP BY 1
       ORDER BY 1 DESC
     `);
 
-    const totals = await prisma.invoice.aggregate({
-      where: { businessId: id, type: "SALE", ...filter },
-      _sum: { total: true, taxAmount: true },
-      _count: true,
-    });
+    const periods = rows.map((r) => ({
+      // `month` kept as an alias for backward compatibility with older clients.
+      period: r.period,
+      month: r.period,
+      count: Number(r.count),
+      total: round2(Number(r.total)),
+      tax: round2(Number(r.tax)),
+      online: {
+        count: Number(r.online_count),
+        total: round2(Number(r.online_total)),
+        tax: round2(Number(r.online_tax)),
+      },
+      retail: {
+        count: Number(r.pos_count),
+        total: round2(Number(r.pos_total)),
+        tax: round2(Number(r.pos_tax)),
+      },
+    }));
+
+    const sum = (pick: (p: (typeof periods)[number]) => number) =>
+      round2(periods.reduce((s, p) => s + pick(p), 0));
+    const sumInt = (pick: (p: (typeof periods)[number]) => number) =>
+      periods.reduce((s, p) => s + pick(p), 0);
 
     res.json({
       shop: business.name,
+      groupBy,
       period: { from: from ?? null, to: to ?? null },
-      months: months.map((m) => ({
-        month: m.month,
-        count: Number(m.count),
-        total: round2(Number(m.total)),
-        tax: round2(Number(m.tax)),
-      })),
+      // `months` kept for backward compatibility; `periods` is the new shape.
+      months: periods,
+      periods,
       totals: {
-        total: round2(Number(totals._sum.total ?? 0)),
-        tax: round2(Number(totals._sum.taxAmount ?? 0)),
-        count: totals._count,
+        total: sum((p) => p.total),
+        tax: sum((p) => p.tax),
+        count: sumInt((p) => p.count),
+        online: {
+          total: sum((p) => p.online.total),
+          tax: sum((p) => p.online.tax),
+          count: sumInt((p) => p.online.count),
+        },
+        retail: {
+          total: sum((p) => p.retail.total),
+          tax: sum((p) => p.retail.tax),
+          count: sumInt((p) => p.retail.count),
+        },
       },
     });
   })
