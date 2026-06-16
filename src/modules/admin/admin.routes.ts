@@ -891,6 +891,39 @@ router.get(
   })
 );
 
+// POST /api/admin/stock/backfill-entry-dates — one-click, idempotent backfill:
+// for every in-stock, non-service product that has no inward (entry) movement
+// yet, insert an "Opening stock" IN movement dated today so it gets an entry
+// date. Products added after auto-logging already have one and are skipped.
+router.post(
+  "/stock/backfill-entry-dates",
+  asyncHandler(async (_req, res) => {
+    const today = new Date();
+    const products = await prisma.item.findMany({
+      where: {
+        isService: false,
+        stockQty: { gt: 0 },
+        stockMovements: { none: { quantity: { gt: 0 } } },
+      },
+      select: { id: true, businessId: true, stockQty: true },
+    });
+    if (products.length > 0) {
+      await prisma.stockMovement.createMany({
+        data: products.map((p) => ({
+          businessId: p.businessId,
+          itemId: p.id,
+          type: "IN" as const,
+          quantity: p.stockQty,
+          balanceAfter: p.stockQty,
+          reason: "Opening stock (backfilled)",
+          createdAt: today,
+        })),
+      });
+    }
+    res.json({ backfilled: products.length, date: today });
+  })
+);
+
 // GET /api/admin/items/:itemId/movements?from=&to= — the full entry/exit
 // timeline for ONE product, with the running on-hand balance after each move.
 router.get(
