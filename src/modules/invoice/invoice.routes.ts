@@ -26,6 +26,10 @@ const invoiceSchema = z.object({
   dueDate: z.coerce.date().optional(),
   discount: z.number().nonnegative().default(0),
   notes: z.string().optional(),
+  // When true, each line's rate is treated as GST-inclusive: the tax is split
+  // out so the stored rate/amount are ex-GST and the total equals the entered
+  // (gross) price.
+  taxInclusive: z.boolean().default(false),
   items: z.array(lineSchema).min(1),
 });
 
@@ -79,10 +83,12 @@ router.post(
     });
     if (!party) throw badRequest("Invalid partyId for this business");
 
-    // Compute line amounts and totals.
+    // Compute line amounts and totals. If rates are GST-inclusive, split the
+    // tax out so the stored rate/amount are the ex-GST (taxable) values.
     const lines = body.items.map((l) => {
-      const amount = round2(l.quantity * l.rate);
-      return { ...l, amount };
+      const netRate = round2(l.rate / (body.taxInclusive ? 1 + l.taxRate / 100 : 1));
+      const amount = round2(l.quantity * netRate);
+      return { ...l, rate: netRate, amount };
     });
     const subtotal = round2(lines.reduce((s, l) => s + l.amount, 0));
     const taxAmount = round2(
