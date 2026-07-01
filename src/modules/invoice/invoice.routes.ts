@@ -163,6 +163,115 @@ router.post(
   })
 );
 
+// PUT /api/invoices/:id — edit an existing invoice. Reverses the original
+// stock effect, replaces the line items, recomputes totals/status, and applies
+// the new stock effect — all atomically, keeping the same invoice number.
+router.put(
+  "/:id",
+  requireRole(...BILLING_ROLES),
+  validateBody(invoiceSchema),
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const body = req.body as z.infer<typeof invoiceSchema>;
+
+    const existing = await prisma.invoice.findFirst({
+      where: { id: req.params.id, businessId },
+      include: { items: true },
+    });
+    if (!existing) throw notFound("Invoice not found");
+
+    // The invoice type (SALE/PURCHASE) is not changed by an edit.
+    const type = existing.type;
+
+    const party = await prisma.party.findFirst({
+      where: { id: body.partyId, businessId },
+    });
+    if (!party) throw badRequest("Invalid partyId for this business");
+
+    // Recompute line amounts and totals (honouring tax-inclusive rates).
+    const lines = body.items.map((l) => {
+      const netRate = round2(l.rate / (body.taxInclusive ? 1 + l.taxRate / 100 : 1));
+      const amount = round2(l.quantity * netRate);
+      return { ...l, rate: netRate, amount };
+    });
+    const subtotal = round2(lines.reduce((s, l) => s + l.amount, 0));
+    const taxAmount = round2(
+      lines.reduce((s, l) => s + (l.amount * l.taxRate) / 100, 0)
+    );
+    const total = round2(subtotal - body.discount + taxAmount);
+
+    // Keep any payments already recorded; just re-derive the status.
+    const amountPaid = Number(existing.amountPaid);
+    const status = amountPaid <= 0 ? "UNPAID" : amountPaid >= total ? "PAID" : "PARTIAL";
+
+    const invoice = await prisma.$transaction(async (tx) => {
+      // 1. Reverse the original stock movements.
+      for (const l of existing.items) {
+        if (!l.itemId) continue;
+        const wasSale = type === "SALE";
+        await recordStockMovement(tx, {
+          businessId,
+          itemId: l.itemId,
+          type: wasSale ? StockMovementType.IN : StockMovementType.OUT,
+          quantity: wasSale ? Number(l.quantity) : -Number(l.quantity),
+          reason: `Edit reversal ${existing.invoiceNumber}`,
+          reference: existing.invoiceNumber,
+          invoiceId: existing.id,
+          createdById: req.auth!.userId,
+        });
+      }
+
+      // 2. Replace the line items and update the invoice.
+      await tx.invoiceItem.deleteMany({ where: { invoiceId: existing.id } });
+      const updated = await tx.invoice.update({
+        where: { id: existing.id },
+        data: {
+          partyId: body.partyId,
+          invoiceDate: body.invoiceDate ?? existing.invoiceDate,
+          dueDate: body.dueDate ?? null,
+          subtotal,
+          discount: body.discount,
+          taxAmount,
+          total,
+          status,
+          notes: body.notes ?? null,
+          items: {
+            create: lines.map((l) => ({
+              itemId: l.itemId ?? null,
+              description: l.description,
+              quantity: l.quantity,
+              rate: l.rate,
+              taxRate: l.taxRate,
+              amount: l.amount,
+            })),
+          },
+        },
+        include: { items: true, party: true },
+      });
+
+      // 3. Apply the new stock movements.
+      for (const l of lines) {
+        if (!l.itemId) continue;
+        const isSale = type === "SALE";
+        await recordStockMovement(tx, {
+          businessId,
+          itemId: l.itemId,
+          type: isSale ? StockMovementType.OUT : StockMovementType.IN,
+          quantity: isSale ? -l.quantity : l.quantity,
+          reason: `Edit ${existing.invoiceNumber}`,
+          reference: existing.invoiceNumber,
+          invoiceId: existing.id,
+          createdById: req.auth!.userId,
+        });
+      }
+
+      return updated;
+    });
+
+    res.json({ invoice });
+  })
+);
+
 // DELETE /api/invoices/:id — platform admins delete directly (with stock
 // reversal); shop users' deletions are held for admin approval.
 router.delete(
