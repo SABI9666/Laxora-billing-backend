@@ -18,6 +18,9 @@ const updateSchema = z.object({
   // Starting balances for the cash book (cash in shop / money in bank).
   openingCash: z.number().optional(),
   openingBank: z.number().optional(),
+  // Sale invoice numbering: prefix (e.g. "26-") and the next number to issue.
+  saleInvoicePrefix: z.string().max(16).optional().or(z.literal("")),
+  nextSaleNo: z.number().int().positive().optional(),
 });
 
 // GET /api/business — the active business profile.
