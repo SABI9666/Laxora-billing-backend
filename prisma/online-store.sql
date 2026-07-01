@@ -40,3 +40,6 @@ ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "mrp" DECIMAL(14,2) NOT NULL DEFAULT
 ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "publishOnline" BOOLEAN NOT NULL DEFAULT false;
 CREATE INDEX IF NOT EXISTS "Item_businessId_publishOnline_idx"
   ON "Item"("businessId", "publishOnline");
+
+-- 4. Configurable sale-invoice prefix (e.g. "26-" → 26-27394).
+ALTER TABLE "Business" ADD COLUMN IF NOT EXISTS "saleInvoicePrefix" TEXT;

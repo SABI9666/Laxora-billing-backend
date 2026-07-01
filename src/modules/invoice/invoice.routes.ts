@@ -100,8 +100,12 @@ router.post(
             : { nextPurchaseNo: { increment: 1 } },
       });
       const seq = body.type === "SALE" ? biz.nextSaleNo - 1 : biz.nextPurchaseNo - 1;
-      const prefix = body.type === "SALE" ? "INV" : "PUR";
-      const invoiceNumber = `${prefix}-${String(seq).padStart(4, "0")}`;
+      // Sale invoices use the shop's configurable prefix (default "INV-");
+      // purchases always use "PUR-".
+      const invoiceNumber =
+        body.type === "SALE"
+          ? `${biz.saleInvoicePrefix ?? "INV-"}${String(seq).padStart(4, "0")}`
+          : `PUR-${String(seq).padStart(4, "0")}`;
 
       const created = await tx.invoice.create({
         data: {

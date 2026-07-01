@@ -72,6 +72,9 @@ model Business {
   // Next invoice numbers (simple auto-increment per business)
   nextSaleNo     Int        @default(1)
   nextPurchaseNo Int        @default(1)
+  // Prefix for sale invoice numbers (e.g. "INV-" → INV-0001, "26-" → 26-27394).
+  // When null, defaults to "INV-".
+  saleInvoicePrefix String?
   // Online store integration: bills from the e-commerce website get their own
   // ONL-xxxx number series, and the website authenticates with this API key.
   nextOnlineSaleNo  Int     @default(1)
