@@ -255,10 +255,14 @@ router.post(
     const itemRows = itemIds.length
       ? await prisma.item.findMany({
           where: { id: { in: itemIds } },
-          select: { id: true, purchasePrice: true },
+          select: { id: true, purchasePrice: true, taxRate: true },
         })
       : [];
-    const priceMap = new Map(itemRows.map((i) => [i.id, Number(i.purchasePrice)]));
+    // Purchase prices are GST-inclusive; store the returned goods' cost ex-GST
+    // so it matches the ex-GST COGS used in the P&L.
+    const priceMap = new Map(
+      itemRows.map((i) => [i.id, Number(i.purchasePrice) / (1 + Number(i.taxRate) / 100)])
+    );
     const returnCogs = returned.reduce(
       (s, r) => s + (r.itemId ? r.retQty * (priceMap.get(r.itemId) ?? 0) : 0),
       0

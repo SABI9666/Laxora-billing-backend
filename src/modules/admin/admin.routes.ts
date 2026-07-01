@@ -222,7 +222,9 @@ router.get(
     // P&L is on a CASH basis: revenue = what was actually collected
     // (amountPaid), so it updates as payments are recorded and reflects the
     // final settled amount. Tax inside the collected amount is excluded, and
-    // cost of goods sold (qty * purchase price) is subtracted.
+    // cost of goods sold is subtracted. Purchase prices are entered GST-
+    // inclusive, so COGS is divided by (1 + taxRate/100) to make it ex-GST —
+    // matching ex-GST net sales — for an exact gross profit.
     const conditions = [
       Prisma.sql`inv."businessId" = ${id}`,
       Prisma.sql`inv.type = 'SALE'`,
@@ -237,7 +239,7 @@ router.get(
       WHERE ${Prisma.join(conditions, " AND ")}
     `);
     const cogsRows = await prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
-      SELECT COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
+      SELECT COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
       FROM "InvoiceItem" ii
       JOIN "Invoice" inv ON inv.id = ii."invoiceId"
       JOIN "Item" i ON i.id = ii."itemId"
@@ -307,7 +309,7 @@ router.get(
              COALESCE(SUM(c.cost), 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
-        SELECT SUM(ii.quantity * i."purchasePrice") AS cost
+        SELECT SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)) AS cost
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = inv.id
       ) c ON true
@@ -368,7 +370,7 @@ router.get(
              COALESCE(r.cogs, 0)::float AS retcogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
-        SELECT SUM(ii.quantity * i."purchasePrice") AS cost
+        SELECT SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)) AS cost
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = inv.id
       ) c ON true
@@ -461,7 +463,7 @@ router.get(
 
     const [cogsRows, chargeGroups, returnAgg] = await Promise.all([
       prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
-        SELECT COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
+        SELECT COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = ${invoice.id}
       `),
@@ -708,7 +710,7 @@ router.get(
       prisma.$queryRaw<Array<{ sid: string; outval: number; cogs: number }>>(Prisma.sql`
         SELECT i."supplierId" AS sid,
                COALESCE(SUM(ii.amount), 0)::float AS outval,
-               COALESCE(SUM(ii.quantity * i."purchasePrice"), 0)::float AS cogs
+               COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
         FROM "InvoiceItem" ii
         JOIN "Item" i ON i.id = ii."itemId"
         JOIN "Invoice" inv ON inv.id = ii."invoiceId"
