@@ -214,6 +214,8 @@ model Item {
   imageUrl3     String?
   // When true, this product is shown on the Laxorashopping website.
   publishOnline Boolean   @default(false)
+  // Latest supplier purchase bill (image/PDF) this product was bought on.
+  purchaseBillUrl String?
   createdAt     DateTime  @default(now())
   updatedAt     DateTime  @updatedAt
 
@@ -261,6 +263,8 @@ model Invoice {
   // External reference for online orders (website order id) — used to make
   // order syncing idempotent so the same order never bills twice.
   externalRef   String?
+  // Uploaded bill document (e.g. the supplier's purchase bill), image or PDF.
+  attachmentUrl String?
   invoiceDate   DateTime      @default(now())
   dueDate       DateTime?
   subtotal      Decimal       @default(0) @db.Decimal(14, 2)

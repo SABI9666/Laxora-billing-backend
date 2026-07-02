@@ -43,6 +43,7 @@ const itemSchema = z.object({
   imageUrl2: z.string().optional().nullable(),
   imageUrl3: z.string().optional().nullable(),
   publishOnline: z.boolean().default(false),
+  purchaseBillUrl: z.string().optional().nullable(),
 });
 
 // Ensures a categoryId (if provided) belongs to the active shop.
@@ -65,9 +66,9 @@ router.post(
         "Image storage is not configured. Set the GCS_BUCKET env var on the backend."
       );
     const file = (req as unknown as { file?: Express.Multer.File }).file;
-    if (!file) throw badRequest("No image file received");
-    if (!file.mimetype.startsWith("image/"))
-      throw badRequest("Only image files can be uploaded");
+    if (!file) throw badRequest("No file received");
+    if (!file.mimetype.startsWith("image/") && file.mimetype !== "application/pdf")
+      throw badRequest("Only image or PDF files can be uploaded");
 
     const ext = (file.originalname.split(".").pop() || "jpg")
       .toLowerCase()
