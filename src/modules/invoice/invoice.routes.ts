@@ -26,6 +26,8 @@ const invoiceSchema = z.object({
   dueDate: z.coerce.date().optional(),
   discount: z.number().nonnegative().default(0),
   notes: z.string().optional(),
+  // Uploaded bill document (supplier purchase bill), image or PDF URL.
+  attachmentUrl: z.string().optional().nullable(),
   // When true, each line's rate is treated as GST-inclusive: the tax is split
   // out so the stored rate/amount are ex-GST and the total equals the entered
   // (gross) price.
@@ -126,6 +128,7 @@ router.post(
           taxAmount,
           total,
           notes: body.notes ?? null,
+          attachmentUrl: body.attachmentUrl ?? null,
           items: {
             create: lines.map((l) => ({
               itemId: l.itemId ?? null,
@@ -154,6 +157,14 @@ router.post(
           invoiceId: created.id,
           createdById: req.auth!.userId,
         });
+        // On a purchase with an uploaded bill, link it on the product so the
+        // supplier's bill is visible from the product too.
+        if (!isSale && body.attachmentUrl) {
+          await tx.item.update({
+            where: { id: l.itemId },
+            data: { purchaseBillUrl: body.attachmentUrl },
+          });
+        }
       }
 
       return created;
@@ -235,6 +246,7 @@ router.put(
           total,
           status,
           notes: body.notes ?? null,
+          attachmentUrl: body.attachmentUrl ?? null,
           items: {
             create: lines.map((l) => ({
               itemId: l.itemId ?? null,
@@ -263,6 +275,12 @@ router.put(
           invoiceId: existing.id,
           createdById: req.auth!.userId,
         });
+        if (!isSale && body.attachmentUrl) {
+          await tx.item.update({
+            where: { id: l.itemId },
+            data: { purchaseBillUrl: body.attachmentUrl },
+          });
+        }
       }
 
       return updated;

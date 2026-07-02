@@ -43,3 +43,7 @@ CREATE INDEX IF NOT EXISTS "Item_businessId_publishOnline_idx"
 
 -- 4. Configurable sale-invoice prefix (e.g. "26-" → 26-27394).
 ALTER TABLE "Business" ADD COLUMN IF NOT EXISTS "saleInvoicePrefix" TEXT;
+
+-- 5. Bill attachments (supplier purchase bill) on invoices + products.
+ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "attachmentUrl" TEXT;
+ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "purchaseBillUrl" TEXT;
