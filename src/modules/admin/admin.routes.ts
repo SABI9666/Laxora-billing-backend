@@ -1436,7 +1436,7 @@ router.get(
       where: { businessId: id, type: type as never },
       orderBy: { name: "asc" },
     });
-    const [invAgg, payAgg] = await Promise.all([
+    const [invAgg, payAgg, billInvoices, linkedPayAgg] = await Promise.all([
       prisma.invoice.groupBy({
         by: ["partyId"],
         where: { businessId: id, type: invoiceType as never },
@@ -1447,13 +1447,35 @@ router.get(
         where: { businessId: id },
         _sum: { amount: true },
       }),
+      // For crediting bill-linked charges: each bill's capped settled amount is
+      // amountPaid, and the charge portion of it is amountPaid − payments on
+      // that bill (0 for bills with no charges).
+      prisma.invoice.findMany({
+        where: { businessId: id, type: invoiceType as never },
+        select: { id: true, partyId: true, amountPaid: true },
+      }),
+      prisma.payment.groupBy({
+        by: ["invoiceId"],
+        where: { businessId: id, invoiceId: { not: null } },
+        _sum: { amount: true },
+      }),
     ]);
     const invMap = new Map(invAgg.map((r) => [r.partyId, Number(r._sum.total ?? 0)]));
     const payMap = new Map(payAgg.map((r) => [r.partyId, Number(r._sum.amount ?? 0)]));
+    const linkedPayByInv = new Map(
+      linkedPayAgg.map((r) => [r.invoiceId, Number(r._sum.amount ?? 0)])
+    );
+    // Charge amount that actually settled each party's bills (capped, ≥ 0).
+    const chargeAdjMap = new Map<string, number>();
+    for (const inv of billInvoices) {
+      const settled = Number(inv.amountPaid) - (linkedPayByInv.get(inv.id) ?? 0);
+      if (settled > 0)
+        chargeAdjMap.set(inv.partyId, (chargeAdjMap.get(inv.partyId) ?? 0) + settled);
+    }
 
     const rows = parties.map((p) => {
       const billed = invMap.get(p.id) ?? 0;
-      const paid = payMap.get(p.id) ?? 0;
+      const paid = (payMap.get(p.id) ?? 0) + (chargeAdjMap.get(p.id) ?? 0);
       return {
         id: p.id,
         name: p.name,
@@ -1487,11 +1509,11 @@ router.get(
     const [invoices, payments, creditNotes] = await Promise.all([
       prisma.invoice.findMany({
         where: { partyId: party.id, type: invoiceType as never },
-        select: { invoiceNumber: true, invoiceDate: true, total: true },
+        select: { id: true, invoiceNumber: true, invoiceDate: true, total: true, amountPaid: true },
       }),
       prisma.payment.findMany({
         where: { partyId: party.id },
-        select: { paymentDate: true, amount: true, method: true },
+        select: { paymentDate: true, amount: true, method: true, invoiceId: true },
       }),
       // Returns (credit notes) reduce what the party owes.
       prisma.creditNote.findMany({
@@ -1499,6 +1521,28 @@ router.get(
         select: { date: true, totalAmount: true, invoiceNumber: true },
       }),
     ]);
+
+    // Bill-linked charges (Commission, Transport, …) settle part of the bill,
+    // so they credit the party just like a payment — named by their category.
+    // Only the portion that actually cleared the bill is credited: amountPaid
+    // is capped at the bill total, so (amountPaid − payments on that bill) is
+    // the settling total, allocated across the bill's charges in date order.
+    const billCharges = invoices.length
+      ? await prisma.expense.findMany({
+          where: { invoiceId: { in: invoices.map((i) => i.id) } },
+          select: { invoiceId: true, date: true, amount: true, category: true },
+        })
+      : [];
+    const chargesByInv = new Map<string, { date: Date; amount: number; category: string }[]>();
+    for (const x of billCharges) {
+      const arr = chargesByInv.get(x.invoiceId!) ?? [];
+      arr.push({ date: x.date, amount: Number(x.amount), category: x.category });
+      chargesByInv.set(x.invoiceId!, arr);
+    }
+    const linkedPaid = new Map<string, number>();
+    for (const p of payments)
+      if (p.invoiceId)
+        linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
 
     type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
     const entries: Entry[] = [];
@@ -1528,6 +1572,24 @@ router.get(
         debit: 0,
         credit: Number(cn.totalAmount),
       });
+    }
+    for (const inv of invoices) {
+      const charges = chargesByInv.get(inv.id);
+      if (!charges) continue;
+      let budget = Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0);
+      if (budget <= 0) continue;
+      for (const c of [...charges].sort((a, b) => a.date.getTime() - b.date.getTime())) {
+        if (budget <= 0) break;
+        const credit = Math.min(c.amount, budget);
+        budget -= credit;
+        entries.push({
+          date: c.date,
+          kind: `Bill Charge (${c.category})`,
+          ref: inv.invoiceNumber,
+          debit: 0,
+          credit,
+        });
+      }
     }
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
 
