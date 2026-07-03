@@ -47,3 +47,6 @@ ALTER TABLE "Business" ADD COLUMN IF NOT EXISTS "saleInvoicePrefix" TEXT;
 -- 5. Bill attachments (supplier purchase bill) on invoices + products.
 ALTER TABLE "Invoice" ADD COLUMN IF NOT EXISTS "attachmentUrl" TEXT;
 ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "purchaseBillUrl" TEXT;
+
+-- 6. Expense payment method (cash/bank) so expenses hit the cash book.
+ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "method" TEXT;
