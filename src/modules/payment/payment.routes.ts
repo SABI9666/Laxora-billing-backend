@@ -4,6 +4,7 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
+import { recomputeInvoiceSettlement } from "../../lib/settlement";
 
 const router = Router();
 
@@ -80,23 +81,10 @@ router.post(
         },
       });
 
-      // If linked to an invoice, recompute amountPaid and status.
+      // If linked to an invoice, recompute amountPaid and status (payments
+      // plus any bill-linked charges).
       if (body.invoiceId) {
-        const agg = await tx.payment.aggregate({
-          where: { invoiceId: body.invoiceId },
-          _sum: { amount: true },
-        });
-        const paid = Number(agg._sum.amount ?? 0);
-        const inv = await tx.invoice.findUniqueOrThrow({
-          where: { id: body.invoiceId },
-        });
-        const total = Number(inv.total);
-        const status =
-          paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIAL";
-        await tx.invoice.update({
-          where: { id: body.invoiceId },
-          data: { amountPaid: paid, status },
-        });
+        await recomputeInvoiceSettlement(tx, body.invoiceId);
       }
 
       return created;
@@ -118,23 +106,7 @@ router.delete(
     await prisma.$transaction(async (tx) => {
       await tx.payment.delete({ where: { id: payment.id } });
       if (payment.invoiceId) {
-        const agg = await tx.payment.aggregate({
-          where: { invoiceId: payment.invoiceId },
-          _sum: { amount: true },
-        });
-        const paid = Number(agg._sum.amount ?? 0);
-        const inv = await tx.invoice.findUnique({
-          where: { id: payment.invoiceId },
-        });
-        if (inv) {
-          const total = Number(inv.total);
-          const status =
-            paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIAL";
-          await tx.invoice.update({
-            where: { id: payment.invoiceId },
-            data: { amountPaid: paid, status },
-          });
-        }
+        await recomputeInvoiceSettlement(tx, payment.invoiceId);
       }
     });
 

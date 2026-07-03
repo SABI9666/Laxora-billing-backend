@@ -49,7 +49,7 @@ router.get(
     const invoiceType = type === "CUSTOMER" ? "SALE" : "PURCHASE";
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-    const [parties, invAgg, payAgg, cnAgg] = await Promise.all([
+    const [parties, invAgg, payAgg, cnAgg, billExpenses] = await Promise.all([
       prisma.party.findMany({
         where: { businessId, type: type as never },
         orderBy: { name: "asc" },
@@ -69,7 +69,30 @@ router.get(
         where: { businessId },
         _sum: { totalAmount: true },
       }),
+      // Bill-linked charges settle part of the bill, so they count as "paid"
+      // for the party the bill belongs to (same rule as invoice.amountPaid).
+      prisma.expense.findMany({
+        where: { businessId, invoiceId: { not: null } },
+        select: { invoiceId: true, amount: true },
+      }),
     ]);
+
+    // Expense keeps invoiceId as a plain id (no relation), so resolve each
+    // charge's party through its invoice.
+    const expInvoiceIds = [...new Set(billExpenses.map((e) => e.invoiceId!))];
+    const expInvoices = expInvoiceIds.length
+      ? await prisma.invoice.findMany({
+          where: { id: { in: expInvoiceIds }, businessId, type: invoiceType as never },
+          select: { id: true, partyId: true },
+        })
+      : [];
+    const invPartyMap = new Map(expInvoices.map((i) => [i.id, i.partyId]));
+    const adjMap = new Map<string, number>();
+    for (const e of billExpenses) {
+      const pid = invPartyMap.get(e.invoiceId!);
+      if (!pid) continue;
+      adjMap.set(pid, (adjMap.get(pid) ?? 0) + Number(e.amount));
+    }
 
     const invMap = new Map(invAgg.map((r) => [r.partyId, Number(r._sum.total ?? 0)]));
     const payMap = new Map(payAgg.map((r) => [r.partyId, Number(r._sum.amount ?? 0)]));
@@ -77,7 +100,7 @@ router.get(
 
     const rows = parties.map((p) => {
       const billed = invMap.get(p.id) ?? 0;
-      const paid = payMap.get(p.id) ?? 0;
+      const paid = (payMap.get(p.id) ?? 0) + (adjMap.get(p.id) ?? 0);
       const returns = cnMap.get(p.id) ?? 0;
       return {
         id: p.id,
@@ -120,7 +143,7 @@ router.get(
     const [invoices, payments, creditNotes] = await Promise.all([
       prisma.invoice.findMany({
         where: { partyId: party.id, businessId, type: invoiceType as never },
-        select: { invoiceNumber: true, invoiceDate: true, total: true },
+        select: { id: true, invoiceNumber: true, invoiceDate: true, total: true },
       }),
       prisma.payment.findMany({
         where: { partyId: party.id, businessId },
@@ -131,6 +154,16 @@ router.get(
         select: { date: true, totalAmount: true, invoiceNumber: true },
       }),
     ]);
+
+    // Bill-linked charges (commission, damage, …) settle part of the bill, so
+    // they show as credits in the statement just like payments do.
+    const billExpenses = invoices.length
+      ? await prisma.expense.findMany({
+          where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
+          select: { invoiceId: true, date: true, amount: true, category: true },
+        })
+      : [];
+    const invNumberMap = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
 
     type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
     const entries: Entry[] = [];
@@ -157,6 +190,14 @@ router.get(
         ref: cn.invoiceNumber ?? "",
         debit: 0,
         credit: Number(cn.totalAmount),
+      });
+    for (const x of billExpenses)
+      entries.push({
+        date: x.date,
+        kind: `Bill Charge (${x.category})`,
+        ref: invNumberMap.get(x.invoiceId!) ?? "",
+        debit: 0,
+        credit: Number(x.amount),
       });
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
 

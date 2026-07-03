@@ -15,7 +15,8 @@
     "prisma:deploy": "prisma migrate deploy",
     "prisma:studio": "prisma studio",
     "seed": "tsx prisma/seed.ts",
-    "backfill:entry-dates": "tsx prisma/backfill-entry-dates.ts"
+    "backfill:entry-dates": "tsx prisma/backfill-entry-dates.ts",
+    "backfill:settlement": "tsx prisma/backfill-invoice-settlement.ts"
   },
   "prisma": {
     "seed": "tsx prisma/seed.ts"
