@@ -9,6 +9,11 @@ const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 // absorbs instead of collecting from the customer. Both reduce what is still
 // due, so amountPaid/status are always recomputed from scratch here whenever a
 // payment or a bill-linked expense is created or deleted.
+//
+// The settled amount is capped at the bill total: a charge only ever clears
+// the OUTSTANDING due, never more. So a charge on an already fully-paid bill
+// leaves it PAID with zero due (it is just the shop's cost, tracked in P&L) —
+// it can never push the due negative or hand the customer a phantom credit.
 export async function recomputeInvoiceSettlement(db: Db, invoiceId: string) {
   const [payAgg, expAgg, invoice] = await Promise.all([
     db.payment.aggregate({ where: { invoiceId }, _sum: { amount: true } }),
@@ -17,10 +22,11 @@ export async function recomputeInvoiceSettlement(db: Db, invoiceId: string) {
   ]);
   if (!invoice) return;
 
-  const paid = round2(
-    Number(payAgg._sum.amount ?? 0) + Number(expAgg._sum.amount ?? 0)
-  );
+  const payments = Number(payAgg._sum.amount ?? 0);
+  const charges = Number(expAgg._sum.amount ?? 0);
   const total = Number(invoice.total);
+  // Cap at total so charges never over-settle the bill.
+  const paid = round2(Math.min(payments + charges, total));
   const status = paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIAL";
   await db.invoice.update({
     where: { id: invoiceId },

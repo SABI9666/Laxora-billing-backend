@@ -232,23 +232,20 @@ router.get(
     if (from) conditions.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
     if (to) conditions.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
 
-    // Cash actually received per bill = amountPaid minus any bill-linked
-    // charges. A charge settles the bill's due (so it is inside amountPaid),
-    // but it is NOT customer cash — it is booked as an expense further down.
-    // Excluding it here keeps cash-basis revenue and realised tax to real
-    // payments and prevents the charge being counted as both income and cost.
+    // Cash actually received = customer payments only, read straight from the
+    // Payment table. A bill-linked charge settles the bill's due (it is inside
+    // amountPaid) but is NOT customer cash — it is booked as an expense further
+    // down. Sourcing revenue from payments keeps cash-basis revenue and
+    // realised tax to real money in, and stops the charge being counted as both
+    // income and cost.
     const realizedRows = await prisma.$queryRaw<Array<{ collected: number; tax: number }>>(Prisma.sql`
-      SELECT COALESCE(SUM(x.paid), 0)::float AS collected,
-             COALESCE(SUM(x."taxAmount" * x.paid / NULLIF(x.total, 0)), 0)::float AS tax
-      FROM (
-        SELECT inv.total, inv."taxAmount",
-               inv."amountPaid" - COALESCE(e.exp, 0) AS paid
-        FROM "Invoice" inv
-        LEFT JOIN LATERAL (
-          SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
-        ) e ON true
-        WHERE ${Prisma.join(conditions, " AND ")}
-      ) x
+      SELECT COALESCE(SUM(pm.paid), 0)::float AS collected,
+             COALESCE(SUM(inv."taxAmount" * pm.paid / NULLIF(inv.total, 0)), 0)::float AS tax
+      FROM "Invoice" inv
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
+      ) pm ON true
+      WHERE ${Prisma.join(conditions, " AND ")}
     `);
     const cogsRows = await prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
       SELECT COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
@@ -319,8 +316,8 @@ router.get(
       Array<{ month: string; collected: number; taxrealized: number; cogs: number }>
     >(Prisma.sql`
       SELECT to_char(date_trunc('month', inv."invoiceDate"), 'YYYY-MM') AS month,
-             COALESCE(SUM(inv."amountPaid" - COALESCE(e.exp, 0)), 0)::float AS collected,
-             COALESCE(SUM(inv."taxAmount" * (inv."amountPaid" - COALESCE(e.exp, 0)) / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
+             COALESCE(SUM(pm.paid), 0)::float AS collected,
+             COALESCE(SUM(inv."taxAmount" * pm.paid / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
              COALESCE(SUM(c.cost), 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -329,8 +326,8 @@ router.get(
         WHERE ii."invoiceId" = inv.id
       ) c ON true
       LEFT JOIN LATERAL (
-        SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
-      ) e ON true
+        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
+      ) pm ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       GROUP BY 1
     `);
@@ -380,8 +377,8 @@ router.get(
       }>
     >(Prisma.sql`
       SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
-             (inv."amountPaid" - COALESCE(e.exp, 0))::float AS collected,
-             (inv."taxAmount" * (inv."amountPaid" - COALESCE(e.exp, 0)) / NULLIF(inv.total, 0))::float AS taxrealized,
+             COALESCE(pm.paid, 0)::float AS collected,
+             (inv."taxAmount" * COALESCE(pm.paid, 0) / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs,
              COALESCE(e.exp, 0)::float AS expense,
              COALESCE(r.net, 0)::float AS retnet,
@@ -395,6 +392,9 @@ router.get(
       LEFT JOIN LATERAL (
         SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
       ) e ON true
+      LEFT JOIN LATERAL (
+        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
+      ) pm ON true
       LEFT JOIN LATERAL (
         SELECT SUM("netAmount") AS net, SUM(cogs) AS cogs
         FROM "CreditNote" cn WHERE cn."invoiceId" = inv.id
@@ -479,7 +479,7 @@ router.get(
     });
     if (!invoice) throw notFound("Bill not found");
 
-    const [cogsRows, chargeGroups, returnAgg] = await Promise.all([
+    const [cogsRows, chargeGroups, returnAgg, payAgg] = await Promise.all([
       prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
         SELECT COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
@@ -494,7 +494,13 @@ router.get(
         where: { invoiceId: invoice.id },
         _sum: { netAmount: true, totalAmount: true, cogs: true },
       }),
+      // Real customer cash for this bill (payments only, not settling charges).
+      prisma.payment.aggregate({
+        where: { invoiceId: invoice.id },
+        _sum: { amount: true },
+      }),
     ]);
+    const cashCollected = Number(payAgg._sum.amount ?? 0);
 
     const grossCogs = Number(cogsRows[0]?.cogs ?? 0);
     const charges = chargeGroups.map((g) => ({
@@ -532,9 +538,9 @@ router.get(
         netSale: round2(netSale),
         gst: round2(gst),
         totalBilled: round2(total), // incl GST
-        // amountPaid includes bill-linked charges (they settle the due); show
-        // real customer cash by removing them, but let them reduce outstanding.
-        amountCollected: round2(Number(invoice.amountPaid) - chargesTotal),
+        // Cash collected = customer payments only; amountPaid also folds in the
+        // bill-linked charges that settle the due, so it drives outstanding.
+        amountCollected: round2(cashCollected),
         outstanding: round2(total - Number(invoice.amountPaid) - returnTotal),
         returns: round2(returnTotal),
         cogs: round2(cogs),
