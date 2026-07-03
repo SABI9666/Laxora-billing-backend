@@ -169,21 +169,23 @@ router.get(
     ]);
 
     // Bill-linked charges (commission, damage, …) settle part of the bill, so
-    // they show as a credit in the statement just like payments do. We credit
-    // only the portion that actually cleared the bill: amountPaid is capped at
-    // the bill total, so (amountPaid − payments on that bill) is exactly the
-    // settling charges, never more than the outstanding. One consolidated line
-    // per bill, dated at its latest charge.
+    // they show as credits in the statement just like payments do — each named
+    // by its own category (Commission, Transport, …). We only credit the
+    // portion that actually cleared the bill: amountPaid is capped at the bill
+    // total, so (amountPaid − payments on that bill) is the total settling
+    // charges, never more than the outstanding. When several charges share a
+    // bill we allocate that budget across them in date order.
     const billCharges = invoices.length
       ? await prisma.expense.findMany({
           where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
-          select: { invoiceId: true, date: true },
+          select: { invoiceId: true, date: true, amount: true, category: true },
         })
       : [];
-    const latestChargeDate = new Map<string, Date>();
+    const chargesByInv = new Map<string, { date: Date; amount: number; category: string }[]>();
     for (const x of billCharges) {
-      const cur = latestChargeDate.get(x.invoiceId!);
-      if (!cur || x.date > cur) latestChargeDate.set(x.invoiceId!, x.date);
+      const arr = chargesByInv.get(x.invoiceId!) ?? [];
+      arr.push({ date: x.date, amount: Number(x.amount), category: x.category });
+      chargesByInv.set(x.invoiceId!, arr);
     }
     const linkedPaid = new Map<string, number>();
     for (const p of payments)
@@ -217,17 +219,23 @@ router.get(
         credit: Number(cn.totalAmount),
       });
     for (const inv of invoices) {
-      const chargeDate = latestChargeDate.get(inv.id);
-      if (!chargeDate) continue; // no linked charges on this bill
-      const settled = Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0);
-      if (settled <= 0) continue; // charges didn't clear any outstanding
-      entries.push({
-        date: chargeDate,
-        kind: "Bill Charge Adjustment",
-        ref: inv.invoiceNumber,
-        debit: 0,
-        credit: settled,
-      });
+      const charges = chargesByInv.get(inv.id);
+      if (!charges) continue; // no linked charges on this bill
+      // Total that actually cleared this bill (capped at its outstanding).
+      let budget = Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0);
+      if (budget <= 0) continue;
+      for (const c of [...charges].sort((a, b) => a.date.getTime() - b.date.getTime())) {
+        if (budget <= 0) break;
+        const credit = Math.min(c.amount, budget);
+        budget -= credit;
+        entries.push({
+          date: c.date,
+          kind: `Bill Charge (${c.category})`,
+          ref: inv.invoiceNumber,
+          debit: 0,
+          credit,
+        });
+      }
     }
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
 
