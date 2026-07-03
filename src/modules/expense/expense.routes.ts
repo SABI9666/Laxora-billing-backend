@@ -13,6 +13,8 @@ const expenseSchema = z.object({
   amount: z.number().positive(),
   note: z.string().optional(),
   invoiceId: z.string().optional(),
+  // Cash/bank paid — when set, the cash book reduces that balance.
+  method: z.enum(["CASH", "BANK", "UPI", "CARD", "CHEQUE", "OTHER"]).optional(),
   date: z.coerce.date().optional(),
 });
 
@@ -54,6 +56,7 @@ router.post(
         amount: body.amount,
         note: body.note ?? null,
         invoiceId: body.invoiceId ?? null,
+        method: body.method ?? null,
         date: body.date ?? new Date(),
         createdById: req.auth!.userId,
       },

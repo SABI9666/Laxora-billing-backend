@@ -395,6 +395,9 @@ model Expense {
   category    String // e.g. Commission, Electrician, Damage, Return, Transport, Other
   amount      Decimal  @db.Decimal(14, 2)
   note        String?
+  // How it was paid: "CASH" or "BANK". When set, the cash book reduces that
+  // balance by the expense. Null = not a cash movement (e.g. bill charge).
+  method      String?
   date        DateTime @default(now())
   createdById String?
   createdAt   DateTime @default(now())

@@ -1263,6 +1263,35 @@ router.get(
         }),
       ]);
 
+    // Expenses paid in cash/bank also move money out of the shop, so fold them
+    // into the cash book (money given). Expenses without a method don't move
+    // cash (e.g. a charge booked against a bill).
+    const expBeforeRows = from
+      ? await prisma.$queryRaw<Array<{ method: string; amt: number }>>(
+          Prisma.sql`SELECT method, COALESCE(SUM(amount),0)::float AS amt
+                     FROM "Expense"
+                     WHERE "businessId" = ${id} AND method IS NOT NULL AND date < ${from}
+                     GROUP BY 1`
+        )
+      : [];
+    const expRangeRows = await prisma.$queryRaw<
+      Array<{ day: string; method: string; amt: number }>
+    >(Prisma.sql`
+      SELECT to_char(date_trunc('day', date), 'YYYY-MM-DD') AS day,
+             method, COALESCE(SUM(amount),0)::float AS amt
+      FROM "Expense"
+      WHERE "businessId" = ${id} AND method IS NOT NULL
+        ${from ? Prisma.sql`AND date >= ${from}` : Prisma.empty}
+        ${to ? Prisma.sql`AND date <= ${to}` : Prisma.empty}
+      GROUP BY 1, 2 ORDER BY 1
+    `);
+    const asExpenseFlow = (r: { method: string; amt: number }) => ({
+      direction: "OUT",
+      method: r.method,
+      purpose: "Expense" as string | null,
+      amt: r.amt,
+    });
+
     const cnMap = new Map(
       creditNotes.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
     );
@@ -1283,7 +1312,7 @@ router.get(
     const payables = payableInvoices.map(bill).filter((b) => b.due > 0.009);
 
     // Opening balances at the start of the period.
-    const before = flows(beforeRows);
+    const before = flows([...beforeRows, ...expBeforeRows.map(asExpenseFlow)]);
     let cash = Number(business.openingCash) + before.cashDelta;
     let bank = Number(business.openingBank) + before.bankDelta;
     const openingCash = round2(cash);
@@ -1297,6 +1326,11 @@ router.get(
     for (const r of rangeRows) {
       const list = byDay.get(r.day) ?? [];
       list.push(r);
+      byDay.set(r.day, list);
+    }
+    for (const r of expRangeRows) {
+      const list = byDay.get(r.day) ?? [];
+      list.push(asExpenseFlow(r));
       byDay.set(r.day, list);
     }
     const days = Array.from(byDay.keys())
