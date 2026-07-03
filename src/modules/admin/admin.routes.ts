@@ -232,11 +232,23 @@ router.get(
     if (from) conditions.push(Prisma.sql`inv."invoiceDate" >= ${from}`);
     if (to) conditions.push(Prisma.sql`inv."invoiceDate" <= ${to}`);
 
-    // Tax actually collected = tax share of the paid portion of each bill.
-    const taxRealizedRows = await prisma.$queryRaw<Array<{ tax: number }>>(Prisma.sql`
-      SELECT COALESCE(SUM(inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0)), 0)::float AS tax
-      FROM "Invoice" inv
-      WHERE ${Prisma.join(conditions, " AND ")}
+    // Cash actually received per bill = amountPaid minus any bill-linked
+    // charges. A charge settles the bill's due (so it is inside amountPaid),
+    // but it is NOT customer cash — it is booked as an expense further down.
+    // Excluding it here keeps cash-basis revenue and realised tax to real
+    // payments and prevents the charge being counted as both income and cost.
+    const realizedRows = await prisma.$queryRaw<Array<{ collected: number; tax: number }>>(Prisma.sql`
+      SELECT COALESCE(SUM(x.paid), 0)::float AS collected,
+             COALESCE(SUM(x."taxAmount" * x.paid / NULLIF(x.total, 0)), 0)::float AS tax
+      FROM (
+        SELECT inv.total, inv."taxAmount",
+               inv."amountPaid" - COALESCE(e.exp, 0) AS paid
+        FROM "Invoice" inv
+        LEFT JOIN LATERAL (
+          SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
+        ) e ON true
+        WHERE ${Prisma.join(conditions, " AND ")}
+      ) x
     `);
     const cogsRows = await prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
       SELECT COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
@@ -248,11 +260,14 @@ router.get(
     const cogs = Number(cogsRows[0]?.cogs ?? 0);
 
     const salesGross = Number(sales._sum.total ?? 0); // total billed
-    const amountCollected = Number(sales._sum.amountPaid ?? 0); // actually received
-    const taxCollected = Number(taxRealizedRows[0]?.tax ?? 0);
+    // amountPaid includes bill-linked charges (they settle the due); use it for
+    // the receivable, but use the charge-free "collected" for cash revenue.
+    const amountSettled = Number(sales._sum.amountPaid ?? 0); // payments + charges
+    const amountCollected = Number(realizedRows[0]?.collected ?? 0); // real cash in
+    const taxCollected = Number(realizedRows[0]?.tax ?? 0);
     const netRevenue = amountCollected - taxCollected; // realised sales, ex-tax
     const grossProfit = netRevenue - cogs;
-    const outstanding = salesGross - amountCollected; // still to be received
+    const outstanding = salesGross - amountSettled; // still to be received
 
     // Expenses / charges (commission, damage, returns, etc.) reduce profit.
     const expConditions = [Prisma.sql`"businessId" = ${id}`];
@@ -304,8 +319,8 @@ router.get(
       Array<{ month: string; collected: number; taxrealized: number; cogs: number }>
     >(Prisma.sql`
       SELECT to_char(date_trunc('month', inv."invoiceDate"), 'YYYY-MM') AS month,
-             COALESCE(SUM(inv."amountPaid"), 0)::float AS collected,
-             COALESCE(SUM(inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
+             COALESCE(SUM(inv."amountPaid" - COALESCE(e.exp, 0)), 0)::float AS collected,
+             COALESCE(SUM(inv."taxAmount" * (inv."amountPaid" - COALESCE(e.exp, 0)) / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
              COALESCE(SUM(c.cost), 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -313,6 +328,9 @@ router.get(
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = inv.id
       ) c ON true
+      LEFT JOIN LATERAL (
+        SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
+      ) e ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       GROUP BY 1
     `);
@@ -362,8 +380,8 @@ router.get(
       }>
     >(Prisma.sql`
       SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
-             inv."amountPaid"::float AS collected,
-             (inv."taxAmount" * inv."amountPaid" / NULLIF(inv.total, 0))::float AS taxrealized,
+             (inv."amountPaid" - COALESCE(e.exp, 0))::float AS collected,
+             (inv."taxAmount" * (inv."amountPaid" - COALESCE(e.exp, 0)) / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs,
              COALESCE(e.exp, 0)::float AS expense,
              COALESCE(r.net, 0)::float AS retnet,
@@ -514,7 +532,9 @@ router.get(
         netSale: round2(netSale),
         gst: round2(gst),
         totalBilled: round2(total), // incl GST
-        amountCollected: round2(Number(invoice.amountPaid)),
+        // amountPaid includes bill-linked charges (they settle the due); show
+        // real customer cash by removing them, but let them reduce outstanding.
+        amountCollected: round2(Number(invoice.amountPaid) - chargesTotal),
         outstanding: round2(total - Number(invoice.amountPaid) - returnTotal),
         returns: round2(returnTotal),
         cogs: round2(cogs),
