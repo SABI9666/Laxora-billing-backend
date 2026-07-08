@@ -190,6 +190,16 @@ router.put(
       select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
 
+    // Count this edit in the dashboard's per-day activity.
+    await prisma.activityLog.create({
+      data: {
+        businessId: req.businessId!,
+        type: "ITEM_EDIT",
+        refId: existing.id,
+        userId: req.auth!.userId,
+      },
+    });
+
     // Platform admins and the shop's OWNER apply changes immediately; other
     // roles' edits are held for admin approval.
     if (user?.isPlatformAdmin || req.memberRole === "OWNER") {
