@@ -50,3 +50,18 @@ ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "purchaseBillUrl" TEXT;
 
 -- 6. Expense payment method (cash/bank) so expenses hit the cash book.
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "method" TEXT;
+
+-- 7. Activity log for the dashboard's per-day entry counts (product edits).
+CREATE TABLE IF NOT EXISTS "ActivityLog" (
+  "id" TEXT NOT NULL,
+  "businessId" TEXT NOT NULL,
+  "type" TEXT NOT NULL,
+  "refId" TEXT,
+  "userId" TEXT,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT "ActivityLog_pkey" PRIMARY KEY ("id"),
+  CONSTRAINT "ActivityLog_businessId_fkey" FOREIGN KEY ("businessId")
+    REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE INDEX IF NOT EXISTS "ActivityLog_businessId_createdAt_idx"
+  ON "ActivityLog"("businessId", "createdAt");

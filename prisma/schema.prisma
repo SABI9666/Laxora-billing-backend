@@ -97,6 +97,7 @@ model Business {
   creditNotes    CreditNote[]
   changeRequests ItemChangeRequest[]
   deleteRequests InvoiceDeleteRequest[]
+  activityLogs   ActivityLog[]
 
   @@index([franchiseId])
 }
@@ -456,6 +457,24 @@ model ItemChangeRequest {
   @@index([businessId])
   @@index([status])
   @@index([businessId, status])
+}
+
+// ----------------------------------------------------------------------------
+// Activity log — lightweight per-day "entries made in the software" counter
+// for the dashboard (e.g. product edits). Creates are derived from createdAt
+// on their own tables; only actions without a natural timestamp are logged.
+// ----------------------------------------------------------------------------
+
+model ActivityLog {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  type       String // e.g. ITEM_EDIT
+  refId      String?
+  userId     String?
+  createdAt  DateTime @default(now())
+
+  @@index([businessId, createdAt])
 }
 
 // A shop's request to delete an invoice — held for platform-admin approval.
