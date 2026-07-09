@@ -63,7 +63,12 @@ router.get(
   asyncHandler(async (req, res) => {
     const invoice = await prisma.invoice.findFirst({
       where: { id: req.params.id, businessId: req.businessId! },
-      include: { items: true, party: true, payments: true },
+      include: {
+        // Include the linked product's HSN and unit for the tax-invoice print.
+        items: { include: { item: { select: { hsn: true, unit: true } } } },
+        party: true,
+        payments: true,
+      },
     });
     if (!invoice) throw notFound("Invoice not found");
     res.json({ invoice });
