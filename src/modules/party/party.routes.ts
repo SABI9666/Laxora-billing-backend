@@ -15,6 +15,9 @@ const partySchema = z.object({
   gstin: z.string().optional(),
   billingAddress: z.string().optional(),
   openingBalance: z.number().default(0),
+  // When true, create even if a same-name party already exists (the user
+  // confirmed it's a genuinely different person).
+  force: z.boolean().optional(),
 });
 
 // GET /api/parties?type=CUSTOMER&search=foo
@@ -195,8 +198,28 @@ router.post(
   "/",
   validateBody(partySchema),
   asyncHandler(async (req, res) => {
+    const { force, ...data } = req.body as z.infer<typeof partySchema>;
+
+    // Prevent duplicate names within a shop (per type). If one exists and the
+    // caller hasn't confirmed, return it so the UI can ask "is it this one?".
+    if (!force) {
+      const existing = await prisma.party.findFirst({
+        where: {
+          businessId: req.businessId!,
+          type: data.type,
+          name: { equals: data.name.trim(), mode: "insensitive" },
+        },
+      });
+      if (existing) {
+        return res.status(409).json({
+          error: `A ${data.type.toLowerCase()} named "${existing.name}" already exists.`,
+          details: { duplicate: true, existing },
+        });
+      }
+    }
+
     const party = await prisma.party.create({
-      data: { ...req.body, businessId: req.businessId! },
+      data: { ...data, name: data.name.trim(), businessId: req.businessId! },
     });
     res.status(201).json({ party });
   })
