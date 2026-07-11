@@ -1,6 +1,6 @@
 import { Router } from "express";
 import { z } from "zod";
-import { StockMovementType } from "@prisma/client";
+import { Prisma, StockMovementType } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
@@ -53,7 +53,33 @@ router.get(
       include: { party: { select: { id: true, name: true } } },
       orderBy: { createdAt: "desc" },
     });
-    res.json({ invoices });
+
+    // Per-bill profit for SALE invoices: ex-GST net revenue (subtotal −
+    // discount) minus ex-GST cost of goods (purchase price is GST-inclusive).
+    const saleIds = invoices.filter((i) => i.type === "SALE").map((i) => i.id);
+    const profitMap = new Map<string, number>();
+    if (saleIds.length) {
+      const cogsRows = await prisma.$queryRaw<Array<{ invoiceid: string; cogs: number }>>(
+        Prisma.sql`
+          SELECT ii."invoiceId" AS invoiceid,
+                 COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
+          FROM "InvoiceItem" ii
+          JOIN "Item" i ON i.id = ii."itemId"
+          WHERE ii."invoiceId" IN (${Prisma.join(saleIds)})
+          GROUP BY 1
+        `
+      );
+      const cogsMap = new Map(cogsRows.map((r) => [r.invoiceid, Number(r.cogs)]));
+      for (const inv of invoices) {
+        if (inv.type !== "SALE") continue;
+        const profit = Number(inv.subtotal) - Number(inv.discount) - (cogsMap.get(inv.id) ?? 0);
+        profitMap.set(inv.id, Math.round((profit + Number.EPSILON) * 100) / 100);
+      }
+    }
+
+    res.json({
+      invoices: invoices.map((inv) => ({ ...inv, profit: profitMap.get(inv.id) ?? null })),
+    });
   })
 );
 
