@@ -158,6 +158,59 @@ router.get(
   })
 );
 
+// GET /api/items/:id/price-history — the last sale rate given to each customer
+// for this product, so the biller can see "what did we charge Raju vs Manu".
+router.get(
+  "/:id/price-history",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const rows = await prisma.invoiceItem.findMany({
+      where: { itemId: req.params.id, invoice: { businessId, type: "SALE" } },
+      select: {
+        rate: true,
+        taxRate: true,
+        quantity: true,
+        invoice: {
+          select: {
+            invoiceNumber: true,
+            invoiceDate: true,
+            party: { select: { id: true, name: true } },
+          },
+        },
+      },
+      orderBy: { invoice: { invoiceDate: "desc" } },
+      take: 60,
+    });
+
+    // Keep the most recent rate per customer, up to 10 distinct customers.
+    const seen = new Set<string>();
+    const history: {
+      party: string;
+      rate: number;
+      taxRate: number;
+      quantity: number;
+      invoiceNumber: string;
+      date: Date;
+    }[] = [];
+    for (const r of rows) {
+      const name = r.invoice.party?.name ?? "—";
+      const key = r.invoice.party?.id ?? name;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      history.push({
+        party: name,
+        rate: Number(r.rate),
+        taxRate: Number(r.taxRate),
+        quantity: Number(r.quantity),
+        invoiceNumber: r.invoice.invoiceNumber,
+        date: r.invoice.invoiceDate,
+      });
+      if (history.length >= 10) break;
+    }
+    res.json({ history });
+  })
+);
+
 // POST /api/items
 router.post(
   "/",
