@@ -7,6 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
 import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
+import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
 const router = Router();
@@ -270,7 +271,18 @@ router.get(
     const expConditions = [Prisma.sql`"businessId" = ${id}`];
     if (from) expConditions.push(Prisma.sql`date >= ${from}`);
     if (to) expConditions.push(Prisma.sql`date <= ${to}`);
-    const [expTotalRows, monthlyExpRows, retTotalRows, monthlyRetRows] = await Promise.all([
+
+    // Service / other income = standalone credit vouchers (e.g. LED service).
+    // They carry no COGS, so the full amount adds to gross and net profit.
+    const svcConditions = [
+      Prisma.sql`"businessId" = ${id}`,
+      Prisma.sql`direction = 'IN'`,
+      Prisma.sql`purpose IN (${Prisma.join(INCOME_PURPOSE_LIST)})`,
+    ];
+    if (from) svcConditions.push(Prisma.sql`"paymentDate" >= ${from}`);
+    if (to) svcConditions.push(Prisma.sql`"paymentDate" <= ${to}`);
+
+    const [expTotalRows, monthlyExpRows, retTotalRows, monthlyRetRows, svcTotalRows, monthlySvcRows] = await Promise.all([
       prisma.$queryRaw<Array<{ total: number }>>(Prisma.sql`
         SELECT COALESCE(SUM(amount), 0)::float AS total FROM "Expense"
         WHERE ${Prisma.join(expConditions, " AND ")}
@@ -295,9 +307,22 @@ router.get(
         FROM "CreditNote" WHERE ${Prisma.join(expConditions, " AND ")}
         GROUP BY 1
       `),
+      // Service / other income totals and monthly breakdown.
+      prisma.$queryRaw<Array<{ total: number }>>(Prisma.sql`
+        SELECT COALESCE(SUM(amount), 0)::float AS total FROM "Payment"
+        WHERE ${Prisma.join(svcConditions, " AND ")}
+      `),
+      prisma.$queryRaw<Array<{ month: string; inc: number }>>(Prisma.sql`
+        SELECT to_char(date_trunc('month', "paymentDate"), 'YYYY-MM') AS month,
+               COALESCE(SUM(amount), 0)::float AS inc
+        FROM "Payment" WHERE ${Prisma.join(svcConditions, " AND ")}
+        GROUP BY 1
+      `),
     ]);
     const totalExpenses = Number(expTotalRows[0]?.total ?? 0);
     const expByMonth = new Map(monthlyExpRows.map((r) => [r.month, Number(r.exp)]));
+    const serviceIncome = Number(svcTotalRows[0]?.total ?? 0);
+    const svcByMonth = new Map(monthlySvcRows.map((r) => [r.month, Number(r.inc)]));
 
     // Apply returns: reduce net revenue and cost of goods.
     const returnsNet = Number(retTotalRows[0]?.net ?? 0);
@@ -306,7 +331,11 @@ router.get(
     const adjNetRevenue = netRevenue - returnsNet;
     const adjCogs = cogs - returnsCogs;
     const adjGrossProfit = adjNetRevenue - adjCogs;
-    const netProfit = adjGrossProfit - totalExpenses;
+    // Service income has no cost of goods, so it flows straight into net profit.
+    const netProfit = adjGrossProfit + serviceIncome - totalExpenses;
+    // Total income (sales + service) — used as the denominator for net margin so
+    // service-only shops still get a meaningful percentage.
+    const totalIncome = adjNetRevenue + serviceIncome;
     const retByMonth = new Map(
       monthlyRetRows.map((r) => [r.month, { net: Number(r.net), cogs: Number(r.cogs) }])
     );
@@ -344,6 +373,7 @@ router.get(
       ...salesByMonth.keys(),
       ...expByMonth.keys(),
       ...retByMonth.keys(),
+      ...svcByMonth.keys(),
     ]);
     const monthly = Array.from(allMonths)
       .sort()
@@ -351,14 +381,16 @@ router.get(
         const s = salesByMonth.get(month) ?? { net: 0, cogs: 0 };
         const exp = expByMonth.get(month) ?? 0;
         const ret = retByMonth.get(month) ?? { net: 0, cogs: 0 };
+        const svc = svcByMonth.get(month) ?? 0; // service / other income
         const net = s.net - ret.net; // revenue net of returns
         const cgs = s.cogs - ret.cogs; // cost net of returned goods
         return {
           month,
           salesNet: round2(net),
+          serviceIncome: round2(svc),
           cogs: round2(cgs),
           expenses: round2(exp),
-          profit: round2(net - cgs - exp),
+          profit: round2(net + svc - cgs - exp),
         };
       });
 
@@ -413,12 +445,13 @@ router.get(
         outstanding: round2(outstanding),
         returns: round2(returnsTotal),
         salesNet: round2(adjNetRevenue),
+        serviceIncome: round2(serviceIncome),
         cogs: round2(adjCogs),
         grossProfit: round2(adjGrossProfit),
         grossMarginPct: adjNetRevenue ? round2((adjGrossProfit / adjNetRevenue) * 100) : 0,
         expenses: round2(totalExpenses),
         netProfit: round2(netProfit),
-        netMarginPct: adjNetRevenue ? round2((netProfit / adjNetRevenue) * 100) : 0,
+        netMarginPct: totalIncome ? round2((netProfit / totalIncome) * 100) : 0,
         taxCollected: round2(taxCollected),
         purchases: round2(Number(purchases._sum.total ?? 0)),
         taxPaid: round2(Number(purchases._sum.taxAmount ?? 0)),
