@@ -2,6 +2,7 @@ import { Router } from "express";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
+import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 const router = Router();
 
@@ -81,8 +82,10 @@ router.get(
 
     // Sales + cash-out pieces for a period → profit (net revenue is ex-GST;
     // COGS is de-grossed to ex-GST to match; expenses subtract fully).
+    // Service/other income (credit vouchers, e.g. LED service) is added on top
+    // of sales — it has no COGS, so the full amount is profit.
     const profitFor = async (from: Date) => {
-      const [rev, cogsRows, exp] = await Promise.all([
+      const [rev, cogsRows, exp, svc] = await Promise.all([
         prisma.invoice.aggregate({
           where: { businessId, type: "SALE", invoiceDate: { gte: from } },
           _sum: { subtotal: true, discount: true, total: true },
@@ -101,18 +104,29 @@ router.get(
           where: { businessId, date: { gte: from } },
           _sum: { amount: true },
         }),
+        prisma.payment.aggregate({
+          where: {
+            businessId,
+            direction: "IN",
+            purpose: { in: INCOME_PURPOSE_LIST },
+            paymentDate: { gte: from },
+          },
+          _sum: { amount: true },
+        }),
       ]);
       const netRevenue =
         Number(rev._sum.subtotal ?? 0) - Number(rev._sum.discount ?? 0);
       const cogs = Number(cogsRows[0]?.cogs ?? 0);
       const expenses = Number(exp._sum.amount ?? 0);
+      const serviceIncome = Number(svc._sum.amount ?? 0);
       return {
         sales: round2(Number(rev._sum.total ?? 0)),
         bills: rev._count,
         netRevenue: round2(netRevenue),
+        serviceIncome: round2(serviceIncome),
         cogs: round2(cogs),
         expenses: round2(expenses),
-        profit: round2(netRevenue - cogs - expenses),
+        profit: round2(netRevenue + serviceIncome - cogs - expenses),
       };
     };
 
