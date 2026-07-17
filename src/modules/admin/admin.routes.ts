@@ -6,7 +6,7 @@ import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
-import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
+import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
@@ -1761,7 +1761,7 @@ router.get(
   "/change-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
-    const [requests, deletePending] = await Promise.all([
+    const [requests, deletePending, returnDeletePending] = await Promise.all([
       prisma.itemChangeRequest.findMany({
         where: { status },
         include: { business: { select: { name: true } } },
@@ -1769,8 +1769,12 @@ router.get(
         take: 200,
       }),
       prisma.invoiceDeleteRequest.count({ where: { status: "PENDING" } }),
+      prisma.returnDeleteRequest.count({ where: { status: "PENDING" } }),
     ]);
-    res.json({ requests, pendingCount: requests.length + deletePending });
+    res.json({
+      requests,
+      pendingCount: requests.length + deletePending + returnDeletePending,
+    });
   })
 );
 
@@ -1819,6 +1823,60 @@ router.post(
     });
     if (!request) throw notFound("Request not found");
     await prisma.invoiceDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "REJECTED", reviewedAt: new Date() },
+    });
+    res.status(204).send();
+  })
+);
+
+// ---- Sales-return deletion approvals ----------------------------------------
+
+// GET /api/admin/return-delete-requests?status=PENDING
+router.get(
+  "/return-delete-requests",
+  asyncHandler(async (req, res) => {
+    const status = req.query.status ? String(req.query.status) : "PENDING";
+    const requests = await prisma.returnDeleteRequest.findMany({
+      where: { status },
+      include: { business: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    res.json({ requests });
+  })
+);
+
+// POST /api/admin/return-delete-requests/:id/approve — reverse the return.
+router.post(
+  "/return-delete-requests/:id/approve",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    if (request.status !== "PENDING") throw badRequest("This request was already reviewed");
+
+    // The credit note may have already been reversed (e.g. the bill was
+    // deleted). Reverse it if it still exists, then close out the request.
+    await reverseReturn(request.creditNoteId, request.businessId, req.auth!.userId);
+    await prisma.returnDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "APPROVED", reviewedAt: new Date() },
+    });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/admin/return-delete-requests/:id/reject — keep the return.
+router.post(
+  "/return-delete-requests/:id/reject",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    await prisma.returnDeleteRequest.update({
       where: { id: request.id },
       data: { status: "REJECTED", reviewedAt: new Date() },
     });
@@ -1918,5 +1976,18 @@ router.delete(
     res.status(204).send();
   })
 );
+
+// Any /api/admin/* path that matched no route above is a genuine 404. Return it
+// as such so the request never falls through to the global tenant middleware,
+// which for a platform admin would misleadingly report "No business found for
+// this user". That fall-through is what happens when the deployed backend is
+// older than the admin panel and is missing a report endpoint the panel calls —
+// this 404 (message contains "not found") lets the panel show its proper
+// "report isn't available yet — redeploy the backend" hint instead.
+router.use((req, res) => {
+  res
+    .status(404)
+    .json({ error: `Admin endpoint not found: ${req.method} ${req.originalUrl}` });
+});
 
 export default router;
