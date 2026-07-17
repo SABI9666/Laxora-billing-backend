@@ -401,18 +401,23 @@ router.post(
 
     let returnNet = 0;
     let returnTax = 0;
-    const returned: { itemId: string | null; retQty: number }[] = [];
+    const returned: { itemId: string | null; retQty: number; invoiceItemId: string }[] = [];
     for (const li of invoice.items) {
       const reqQty = reqMap.get(li.id);
       if (!reqQty) continue;
-      const retQty = Math.min(reqQty, Number(li.quantity));
+      // Only allow returning what hasn't been returned already.
+      const remaining = Number(li.quantity) - Number(li.returnedQty);
+      const retQty = Math.min(reqQty, remaining);
       if (retQty <= 0) continue;
       const lineNet = retQty * Number(li.rate);
       returnNet += lineNet;
       returnTax += (lineNet * Number(li.taxRate)) / 100;
-      returned.push({ itemId: li.itemId, retQty });
+      returned.push({ itemId: li.itemId, retQty, invoiceItemId: li.id });
     }
-    if (returned.length === 0) throw badRequest("Nothing to return on this bill");
+    if (returned.length === 0)
+      throw badRequest(
+        "Nothing left to return on this bill — these items were already returned."
+      );
 
     // Cost of the returned goods (for COGS reduction in P&L).
     const itemIds = returned.map((r) => r.itemId).filter(Boolean) as string[];
@@ -436,6 +441,11 @@ router.post(
 
     const creditNote = await prisma.$transaction(async (tx) => {
       for (const r of returned) {
+        // Record how much of this line is now returned (prevents re-returning).
+        await tx.invoiceItem.update({
+          where: { id: r.invoiceItemId },
+          data: { returnedQty: { increment: r.retQty } },
+        });
         if (!r.itemId) continue;
         await recordStockMovement(tx, {
           businessId,

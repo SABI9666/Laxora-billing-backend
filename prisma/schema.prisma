@@ -295,6 +295,9 @@ model InvoiceItem {
   item        Item?   @relation(fields: [itemId], references: [id])
   description String
   quantity    Decimal @default(1) @db.Decimal(14, 3)
+  // How much of this line has already been returned — caps further returns so
+  // the same items can't be returned twice.
+  returnedQty Decimal @default(0) @db.Decimal(14, 3)
   rate        Decimal @default(0) @db.Decimal(14, 2)
   taxRate     Decimal @default(0) @db.Decimal(5, 2)
   amount      Decimal @default(0) @db.Decimal(14, 2)
