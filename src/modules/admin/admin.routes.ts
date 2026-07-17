@@ -1106,7 +1106,7 @@ router.get(
       }),
       prisma.payment.findMany({
         where: { partyId: party.id },
-        select: { paymentDate: true, amount: true, method: true },
+        select: { paymentDate: true, amount: true, method: true, direction: true },
       }),
       // Returns (credit notes) reduce what the party owes.
       prisma.creditNote.findMany({
@@ -1126,13 +1126,17 @@ router.get(
         credit: 0,
       });
     }
+    // A payment in the party's usual direction (customer pays IN, we pay a
+    // supplier OUT) reduces what's owed. The opposite direction is a refund.
+    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
     for (const p of payments) {
+      const reduces = p.direction === reduceDir;
       entries.push({
         date: p.paymentDate,
-        kind: `Payment (${p.method})`,
+        kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
         ref: "",
-        debit: 0,
-        credit: Number(p.amount),
+        debit: reduces ? 0 : Number(p.amount),
+        credit: reduces ? Number(p.amount) : 0,
       });
     }
     for (const cn of creditNotes) {
