@@ -1,11 +1,11 @@
 import { Router } from "express";
 import { z } from "zod";
-import { Prisma, StockMovementType } from "@prisma/client";
+import { Prisma, StockMovementType, PaymentDirection, PaymentMethod } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
-import { requireRole, BILLING_ROLES } from "../../middleware/roles";
+import { requireRole, BILLING_ROLES, SHOP_MANAGERS } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
 import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
 
@@ -379,6 +379,9 @@ router.delete(
 // original bill is kept intact for history.
 const returnSchema = z.object({
   reason: z.string().optional(),
+  // When the customer is physically given money back, choose CASH or BANK so the
+  // cash book drops by the refund. Leave empty to only credit the ledger.
+  refundMethod: z.enum(["CASH", "BANK"]).optional(),
   items: z
     .array(z.object({ invoiceItemId: z.string().min(1), quantity: z.number().positive() }))
     .min(1),
@@ -401,7 +404,13 @@ router.post(
 
     let returnNet = 0;
     let returnTax = 0;
-    const returned: { itemId: string | null; retQty: number; invoiceItemId: string }[] = [];
+    const returned: {
+      itemId: string | null;
+      retQty: number;
+      invoiceItemId: string;
+      rate: number;
+      taxRate: number;
+    }[] = [];
     for (const li of invoice.items) {
       const reqQty = reqMap.get(li.id);
       if (!reqQty) continue;
@@ -412,7 +421,13 @@ router.post(
       const lineNet = retQty * Number(li.rate);
       returnNet += lineNet;
       returnTax += (lineNet * Number(li.taxRate)) / 100;
-      returned.push({ itemId: li.itemId, retQty, invoiceItemId: li.id });
+      returned.push({
+        itemId: li.itemId,
+        retQty,
+        invoiceItemId: li.id,
+        rate: Number(li.rate),
+        taxRate: Number(li.taxRate),
+      });
     }
     if (returned.length === 0)
       throw badRequest(
@@ -439,6 +454,14 @@ router.post(
 
     const returnGross = round2(returnNet + returnTax);
 
+    const lines = returned.map((r) => ({
+      invoiceItemId: r.invoiceItemId,
+      itemId: r.itemId,
+      quantity: r.retQty,
+      rate: r.rate,
+      taxRate: r.taxRate,
+    }));
+
     const creditNote = await prisma.$transaction(async (tx) => {
       for (const r of returned) {
         // Record how much of this line is now returned (prevents re-returning).
@@ -458,6 +481,28 @@ router.post(
           createdById: req.auth!.userId,
         });
       }
+
+      // Optional cash/bank refund: an OUT voucher that lowers the cash book.
+      let refundPaymentId: string | null = null;
+      if (body.refundMethod) {
+        const refund = await tx.payment.create({
+          data: {
+            businessId,
+            partyId: invoice.partyId,
+            invoiceId: invoice.id,
+            direction: PaymentDirection.OUT,
+            purpose: "Sales Return Refund",
+            amount: returnGross,
+            method:
+              body.refundMethod === "BANK" ? PaymentMethod.BANK : PaymentMethod.CASH,
+            notes: `Refund for return on ${invoice.invoiceNumber}${
+              body.reason ? ` - ${body.reason}` : ""
+            }`,
+          },
+        });
+        refundPaymentId = refund.id;
+      }
+
       return tx.creditNote.create({
         data: {
           businessId,
@@ -469,12 +514,98 @@ router.post(
           totalAmount: returnGross,
           cogs: round2(returnCogs),
           reason: body.reason ?? null,
+          lines,
+          refundMethod: body.refundMethod ?? null,
+          refundPaymentId,
           createdById: req.auth!.userId,
         },
       });
     });
 
     res.json({ creditNote, returnedAmount: returnGross });
+  })
+);
+
+// GET /api/invoices/:id/returns — list the returns (credit notes) recorded
+// against a bill, so staff can see exactly what was already returned and undo
+// a wrong entry.
+router.get(
+  "/:id/returns",
+  requireRole(...BILLING_ROLES),
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const returns = await prisma.creditNote.findMany({
+      where: { businessId, invoiceId: req.params.id },
+      orderBy: { createdAt: "desc" },
+    });
+    res.json({ returns });
+  })
+);
+
+// DELETE /api/invoices/:id/return/:creditNoteId — undo a wrong return.
+// Restricted to shop managers/admins. Reverses everything the return did:
+// removes the stock it added back, frees up the returnedQty on each line, and
+// deletes the refund voucher (restoring the cash/bank balance) if there was one.
+router.delete(
+  "/:id/return/:creditNoteId",
+  requireRole(...SHOP_MANAGERS),
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const note = await prisma.creditNote.findFirst({
+      where: { id: req.params.creditNoteId, businessId, invoiceId: req.params.id },
+    });
+    if (!note) throw notFound("Return entry not found");
+
+    const invoice = await prisma.invoice.findFirst({
+      where: { id: req.params.id, businessId },
+      select: { invoiceNumber: true },
+    });
+
+    // Per-line detail is stored on returns created after this feature shipped.
+    const lines = Array.isArray(note.lines)
+      ? (note.lines as Array<{
+          invoiceItemId?: string;
+          itemId?: string | null;
+          quantity?: number;
+        }>)
+      : [];
+
+    await prisma.$transaction(async (tx) => {
+      for (const l of lines) {
+        const qty = Number(l.quantity ?? 0);
+        if (l.invoiceItemId && qty > 0) {
+          // Free up the returned quantity so these items can be sold/returned again.
+          await tx.invoiceItem.updateMany({
+            where: { id: l.invoiceItemId, invoiceId: note.invoiceId ?? undefined },
+            data: { returnedQty: { decrement: qty } },
+          });
+        }
+        if (l.itemId && qty > 0) {
+          // Remove the stock that the return had added back.
+          await recordStockMovement(tx, {
+            businessId,
+            itemId: l.itemId,
+            type: StockMovementType.OUT,
+            quantity: -qty,
+            reason: "Reversal of wrong sales return",
+            reference: invoice?.invoiceNumber ?? note.invoiceNumber,
+            invoiceId: note.invoiceId,
+            createdById: req.auth!.userId,
+          });
+        }
+      }
+
+      // Give the refund back: deleting the OUT voucher restores the cash book.
+      if (note.refundPaymentId) {
+        await tx.payment.deleteMany({
+          where: { id: note.refundPaymentId, businessId },
+        });
+      }
+
+      await tx.creditNote.delete({ where: { id: note.id } });
+    });
+
+    res.json({ ok: true, reversedAmount: Number(note.totalAmount) });
   })
 );
 

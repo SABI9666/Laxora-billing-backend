@@ -54,6 +54,13 @@ ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "method" TEXT;
 -- 8. Track returned quantity per line so items can't be returned twice.
 ALTER TABLE "InvoiceItem" ADD COLUMN IF NOT EXISTS "returnedQty" DECIMAL(14,3) NOT NULL DEFAULT 0;
 
+-- 9. Deletable returns + optional cash/bank refund on a sales return.
+--    lines: per-line breakdown so a wrong return can be reversed exactly.
+--    refundMethod/refundPaymentId: link to the OUT voucher when cash was refunded.
+ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "lines" JSONB;
+ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundMethod" TEXT;
+ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundPaymentId" TEXT;
+
 -- 7. Activity log for the dashboard's per-day entry counts (product edits).
 CREATE TABLE IF NOT EXISTS "ActivityLog" (
   "id" TEXT NOT NULL,
