@@ -51,6 +51,9 @@ ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "purchaseBillUrl" TEXT;
 -- 6. Expense payment method (cash/bank) so expenses hit the cash book.
 ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "method" TEXT;
 
+-- 8. Track returned quantity per line so items can't be returned twice.
+ALTER TABLE "InvoiceItem" ADD COLUMN IF NOT EXISTS "returnedQty" DECIMAL(14,3) NOT NULL DEFAULT 0;
+
 -- 7. Activity log for the dashboard's per-day entry counts (product edits).
 CREATE TABLE IF NOT EXISTS "ActivityLog" (
   "id" TEXT NOT NULL,
