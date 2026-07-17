@@ -5,9 +5,10 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
-import { requireRole, BILLING_ROLES, SHOP_MANAGERS } from "../../middleware/roles";
+import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
 import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
+import { reverseCreditNote } from "../../lib/returnOps";
 
 const router = Router();
 
@@ -542,13 +543,12 @@ router.get(
   })
 );
 
-// DELETE /api/invoices/:id/return/:creditNoteId — undo a wrong return.
-// Restricted to shop managers/admins. Reverses everything the return did:
-// removes the stock it added back, frees up the returnedQty on each line, and
-// deletes the refund voucher (restoring the cash/bank balance) if there was one.
+// DELETE /api/invoices/:id/return/:creditNoteId — remove a wrong return.
+// Platform admins reverse it immediately. Shop users (owner/staff alike) instead
+// raise a removal request that the admin approves in the admin dashboard, so a
+// wrong return can never be wiped without a sign-off.
 router.delete(
   "/:id/return/:creditNoteId",
-  requireRole(...SHOP_MANAGERS),
   asyncHandler(async (req, res) => {
     const businessId = req.businessId!;
     const note = await prisma.creditNote.findFirst({
@@ -556,56 +556,51 @@ router.delete(
     });
     if (!note) throw notFound("Return entry not found");
 
+    const user = await prisma.user.findUnique({
+      where: { id: req.auth!.userId },
+      select: { name: true, username: true, email: true, isPlatformAdmin: true },
+    });
+
+    if (user?.isPlatformAdmin) {
+      await reverseCreditNote(note.id, businessId, req.auth!.userId);
+      return res.json({ ok: true, reversedAmount: Number(note.totalAmount) });
+    }
+
+    // Don't queue the same return twice.
+    const existing = await prisma.returnRemovalRequest.findFirst({
+      where: { creditNoteId: note.id, status: "PENDING" },
+    });
+    if (existing) {
+      return res.status(202).json({
+        pending: true,
+        message: "This return is already waiting for admin approval to be removed.",
+      });
+    }
+
     const invoice = await prisma.invoice.findFirst({
       where: { id: req.params.id, businessId },
-      select: { invoiceNumber: true },
+      select: { party: { select: { name: true } } },
     });
 
-    // Per-line detail is stored on returns created after this feature shipped.
-    const lines = Array.isArray(note.lines)
-      ? (note.lines as Array<{
-          invoiceItemId?: string;
-          itemId?: string | null;
-          quantity?: number;
-        }>)
-      : [];
-
-    await prisma.$transaction(async (tx) => {
-      for (const l of lines) {
-        const qty = Number(l.quantity ?? 0);
-        if (l.invoiceItemId && qty > 0) {
-          // Free up the returned quantity so these items can be sold/returned again.
-          await tx.invoiceItem.updateMany({
-            where: { id: l.invoiceItemId, invoiceId: note.invoiceId ?? undefined },
-            data: { returnedQty: { decrement: qty } },
-          });
-        }
-        if (l.itemId && qty > 0) {
-          // Remove the stock that the return had added back.
-          await recordStockMovement(tx, {
-            businessId,
-            itemId: l.itemId,
-            type: StockMovementType.OUT,
-            quantity: -qty,
-            reason: "Reversal of wrong sales return",
-            reference: invoice?.invoiceNumber ?? note.invoiceNumber,
-            invoiceId: note.invoiceId,
-            createdById: req.auth!.userId,
-          });
-        }
-      }
-
-      // Give the refund back: deleting the OUT voucher restores the cash book.
-      if (note.refundPaymentId) {
-        await tx.payment.deleteMany({
-          where: { id: note.refundPaymentId, businessId },
-        });
-      }
-
-      await tx.creditNote.delete({ where: { id: note.id } });
+    await prisma.returnRemovalRequest.create({
+      data: {
+        businessId,
+        creditNoteId: note.id,
+        invoiceId: note.invoiceId ?? req.params.id,
+        invoiceNumber: note.invoiceNumber ?? "",
+        partyName: invoice?.party?.name ?? null,
+        total: note.totalAmount,
+        refundMethod: note.refundMethod ?? null,
+        reason: (req.query.reason as string) || (req.body?.reason as string) || null,
+        requestedById: req.auth!.userId,
+        requestedByName: user?.name ?? user?.username ?? user?.email ?? null,
+      },
     });
 
-    res.json({ ok: true, reversedAmount: Number(note.totalAmount) });
+    res.status(202).json({
+      pending: true,
+      message: "Sent to the admin for approval. The return stays until an admin approves it.",
+    });
   })
 );
 

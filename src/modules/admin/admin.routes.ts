@@ -7,6 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
 import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
+import { reverseCreditNote } from "../../lib/returnOps";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
 const router = Router();
@@ -1340,6 +1341,77 @@ router.post(
     await prisma.invoiceDeleteRequest.update({
       where: { id: request.id },
       data: { status: "REJECTED", reviewedAt: new Date() },
+    });
+    res.status(204).send();
+  })
+);
+
+// ---- Return removal approvals ----------------------------------------------
+
+// GET /api/admin/return-removals?status=PENDING — wrong returns awaiting review.
+router.get(
+  "/return-removals",
+  asyncHandler(async (req, res) => {
+    const status = req.query.status ? String(req.query.status) : "PENDING";
+    const requests = await prisma.returnRemovalRequest.findMany({
+      where: { status },
+      include: { business: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    res.json({ requests, pendingCount: requests.length });
+  })
+);
+
+// POST /api/admin/return-removals/:id/approve — reverse the return.
+router.post(
+  "/return-removals/:id/approve",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnRemovalRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    if (request.status !== "PENDING") throw badRequest("This request was already reviewed");
+
+    const reviewer = await prisma.user.findUnique({
+      where: { id: req.auth!.userId },
+      select: { name: true, username: true, email: true },
+    });
+
+    // reverseCreditNote is a no-op if the note was already removed; either way
+    // the request is closed so it leaves the queue.
+    await reverseCreditNote(request.creditNoteId, request.businessId, req.auth!.userId);
+    await prisma.returnRemovalRequest.update({
+      where: { id: request.id },
+      data: {
+        status: "APPROVED",
+        reviewedAt: new Date(),
+        reviewedByName: reviewer?.name ?? reviewer?.username ?? reviewer?.email ?? null,
+      },
+    });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/admin/return-removals/:id/reject — keep the return.
+router.post(
+  "/return-removals/:id/reject",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnRemovalRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    const reviewer = await prisma.user.findUnique({
+      where: { id: req.auth!.userId },
+      select: { name: true, username: true, email: true },
+    });
+    await prisma.returnRemovalRequest.update({
+      where: { id: request.id },
+      data: {
+        status: "REJECTED",
+        reviewedAt: new Date(),
+        reviewedByName: reviewer?.name ?? reviewer?.username ?? reviewer?.email ?? null,
+      },
     });
     res.status(204).send();
   })

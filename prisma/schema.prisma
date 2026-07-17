@@ -97,6 +97,7 @@ model Business {
   creditNotes    CreditNote[]
   changeRequests ItemChangeRequest[]
   deleteRequests InvoiceDeleteRequest[]
+  returnRemovals ReturnRemovalRequest[]
   activityLogs   ActivityLog[]
 
   @@index([franchiseId])
@@ -507,4 +508,30 @@ model InvoiceDeleteRequest {
   @@index([businessId])
   @@index([status])
   @@index([invoiceId])
+}
+
+// A shop's request to remove a wrong sales return (credit note). Held for admin
+// approval. On approval the return is reversed (stock removed, returnedQty
+// freed, refund voucher deleted, credit note removed); on reject it stays.
+model ReturnRemovalRequest {
+  id              String    @id @default(cuid())
+  businessId      String
+  business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  creditNoteId    String
+  invoiceId       String
+  invoiceNumber   String
+  partyName       String?
+  total           Decimal   @default(0) @db.Decimal(14, 2)
+  refundMethod    String?
+  reason          String?
+  status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
+  requestedById   String?
+  requestedByName String?
+  createdAt       DateTime  @default(now())
+  reviewedAt      DateTime?
+  reviewedByName  String?
+
+  @@index([businessId])
+  @@index([status])
+  @@index([creditNoteId])
 }
