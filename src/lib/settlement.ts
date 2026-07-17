@@ -15,14 +15,26 @@ const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 // leaves it PAID with zero due (it is just the shop's cost, tracked in P&L) —
 // it can never push the due negative or hand the customer a phantom credit.
 export async function recomputeInvoiceSettlement(db: Db, invoiceId: string) {
-  const [payAgg, expAgg, invoice] = await Promise.all([
-    db.payment.aggregate({ where: { invoiceId }, _sum: { amount: true } }),
-    db.expense.aggregate({ where: { invoiceId }, _sum: { amount: true } }),
-    db.invoice.findUnique({ where: { id: invoiceId } }),
-  ]);
+  const invoice = await db.invoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) return;
 
-  const payments = Number(payAgg._sum.amount ?? 0);
+  const [payGroups, expAgg] = await Promise.all([
+    db.payment.groupBy({
+      by: ["direction"],
+      where: { invoiceId },
+      _sum: { amount: true },
+    }),
+    db.expense.aggregate({ where: { invoiceId }, _sum: { amount: true } }),
+  ]);
+
+  // A sale is settled by money coming IN; a purchase by money going OUT. An
+  // opposite-direction voucher on the bill (e.g. a cash refund on a sales
+  // return) is NOT settlement — it is handled separately as a credit note — so
+  // it must never be counted here, or it would wrongly inflate amountPaid.
+  const settleDir = invoice.type === "PURCHASE" ? "OUT" : "IN";
+  const payments = Number(
+    payGroups.find((g) => g.direction === settleDir)?._sum.amount ?? 0
+  );
   const charges = Number(expAgg._sum.amount ?? 0);
   const total = Number(invoice.total);
   // Cap at total so charges never over-settle the bill.
