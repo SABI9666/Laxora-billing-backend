@@ -6,7 +6,7 @@ import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
-import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
+import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
@@ -1761,7 +1761,7 @@ router.get(
   "/change-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
-    const [requests, deletePending] = await Promise.all([
+    const [requests, deletePending, returnDeletePending] = await Promise.all([
       prisma.itemChangeRequest.findMany({
         where: { status },
         include: { business: { select: { name: true } } },
@@ -1769,8 +1769,12 @@ router.get(
         take: 200,
       }),
       prisma.invoiceDeleteRequest.count({ where: { status: "PENDING" } }),
+      prisma.returnDeleteRequest.count({ where: { status: "PENDING" } }),
     ]);
-    res.json({ requests, pendingCount: requests.length + deletePending });
+    res.json({
+      requests,
+      pendingCount: requests.length + deletePending + returnDeletePending,
+    });
   })
 );
 
@@ -1819,6 +1823,60 @@ router.post(
     });
     if (!request) throw notFound("Request not found");
     await prisma.invoiceDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "REJECTED", reviewedAt: new Date() },
+    });
+    res.status(204).send();
+  })
+);
+
+// ---- Sales-return deletion approvals ----------------------------------------
+
+// GET /api/admin/return-delete-requests?status=PENDING
+router.get(
+  "/return-delete-requests",
+  asyncHandler(async (req, res) => {
+    const status = req.query.status ? String(req.query.status) : "PENDING";
+    const requests = await prisma.returnDeleteRequest.findMany({
+      where: { status },
+      include: { business: { select: { name: true } } },
+      orderBy: { createdAt: "desc" },
+      take: 200,
+    });
+    res.json({ requests });
+  })
+);
+
+// POST /api/admin/return-delete-requests/:id/approve — reverse the return.
+router.post(
+  "/return-delete-requests/:id/approve",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    if (request.status !== "PENDING") throw badRequest("This request was already reviewed");
+
+    // The credit note may have already been reversed (e.g. the bill was
+    // deleted). Reverse it if it still exists, then close out the request.
+    await reverseReturn(request.creditNoteId, request.businessId, req.auth!.userId);
+    await prisma.returnDeleteRequest.update({
+      where: { id: request.id },
+      data: { status: "APPROVED", reviewedAt: new Date() },
+    });
+    res.json({ ok: true });
+  })
+);
+
+// POST /api/admin/return-delete-requests/:id/reject — keep the return.
+router.post(
+  "/return-delete-requests/:id/reject",
+  asyncHandler(async (req, res) => {
+    const request = await prisma.returnDeleteRequest.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!request) throw notFound("Request not found");
+    await prisma.returnDeleteRequest.update({
       where: { id: request.id },
       data: { status: "REJECTED", reviewedAt: new Date() },
     });
