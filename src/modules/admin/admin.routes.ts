@@ -1977,4 +1977,17 @@ router.delete(
   })
 );
 
+// Any /api/admin/* path that matched no route above is a genuine 404. Return it
+// as such so the request never falls through to the global tenant middleware,
+// which for a platform admin would misleadingly report "No business found for
+// this user". That fall-through is what happens when the deployed backend is
+// older than the admin panel and is missing a report endpoint the panel calls —
+// this 404 (message contains "not found") lets the panel show its proper
+// "report isn't available yet — redeploy the backend" hint instead.
+router.use((req, res) => {
+  res
+    .status(404)
+    .json({ error: `Admin endpoint not found: ${req.method} ${req.originalUrl}` });
+});
+
 export default router;
