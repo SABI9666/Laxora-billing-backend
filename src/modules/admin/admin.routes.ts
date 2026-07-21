@@ -1546,7 +1546,7 @@ router.get(
       }),
       prisma.payment.findMany({
         where: { partyId: party.id },
-        select: { paymentDate: true, amount: true, method: true, invoiceId: true },
+        select: { paymentDate: true, amount: true, method: true, invoiceId: true, direction: true },
       }),
       // Returns (credit notes) reduce what the party owes.
       prisma.creditNote.findMany({
@@ -1554,6 +1554,10 @@ router.get(
         select: { date: true, totalAmount: true, invoiceNumber: true },
       }),
     ]);
+
+    // Customer pays IN, supplier is paid OUT — that direction reduces what's
+    // owed; the opposite direction is a refund.
+    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
 
     // Bill-linked charges (Commission, Transport, …) settle part of the bill,
     // so they credit the party just like a payment — named by their category.
@@ -1574,7 +1578,7 @@ router.get(
     }
     const linkedPaid = new Map<string, number>();
     for (const p of payments)
-      if (p.invoiceId)
+      if (p.invoiceId && p.direction === reduceDir)
         linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
 
     type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
@@ -1589,12 +1593,13 @@ router.get(
       });
     }
     for (const p of payments) {
+      const reduces = p.direction === reduceDir;
       entries.push({
         date: p.paymentDate,
-        kind: `Payment (${p.method})`,
+        kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
         ref: "",
-        debit: 0,
-        credit: Number(p.amount),
+        debit: reduces ? 0 : Number(p.amount),
+        credit: reduces ? Number(p.amount) : 0,
       });
     }
     for (const cn of creditNotes) {

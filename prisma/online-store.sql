@@ -61,6 +61,34 @@ ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "lines" JSONB;
 ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundMethod" TEXT;
 ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundPaymentId" TEXT;
 
+-- 10. Return-deletion approval queue: a shop asks to remove a wrong return,
+--     the admin approves/rejects it in the admin dashboard.
+CREATE TABLE IF NOT EXISTS "ReturnDeleteRequest" (
+  "id" TEXT NOT NULL,
+  "businessId" TEXT NOT NULL,
+  "creditNoteId" TEXT NOT NULL,
+  "invoiceId" TEXT,
+  "invoiceNumber" TEXT,
+  "partyName" TEXT,
+  "amount" DECIMAL(14,2) NOT NULL DEFAULT 0,
+  "refundMethod" TEXT,
+  "reason" TEXT,
+  "status" TEXT NOT NULL DEFAULT 'PENDING',
+  "requestedById" TEXT,
+  "requestedByName" TEXT,
+  "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  "reviewedAt" TIMESTAMP(3),
+  CONSTRAINT "ReturnDeleteRequest_pkey" PRIMARY KEY ("id"),
+  CONSTRAINT "ReturnDeleteRequest_businessId_fkey" FOREIGN KEY ("businessId")
+    REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE
+);
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_businessId_idx"
+  ON "ReturnDeleteRequest"("businessId");
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_status_idx"
+  ON "ReturnDeleteRequest"("status");
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_creditNoteId_idx"
+  ON "ReturnDeleteRequest"("creditNoteId");
+
 -- 7. Activity log for the dashboard's per-day entry counts (product edits).
 CREATE TABLE IF NOT EXISTS "ActivityLog" (
   "id" TEXT NOT NULL,

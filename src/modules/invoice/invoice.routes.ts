@@ -247,9 +247,23 @@ router.put(
     const status = amountPaid <= 0 ? "UNPAID" : amountPaid >= total ? "PAID" : "PARTIAL";
 
     const invoice = await prisma.$transaction(async (tx) => {
+      // Only move stock for items that still exist — a product on the original
+      // bill may have been deleted since, which would otherwise crash the edit.
+      const refIds = [
+        ...existing.items.map((l) => l.itemId),
+        ...lines.map((l) => l.itemId),
+      ].filter(Boolean) as string[];
+      const liveItems = refIds.length
+        ? await tx.item.findMany({
+            where: { id: { in: refIds }, businessId },
+            select: { id: true },
+          })
+        : [];
+      const liveSet = new Set(liveItems.map((i) => i.id));
+
       // 1. Reverse the original stock movements.
       for (const l of existing.items) {
-        if (!l.itemId) continue;
+        if (!l.itemId || !liveSet.has(l.itemId)) continue;
         const wasSale = type === "SALE";
         await recordStockMovement(tx, {
           businessId,
@@ -294,7 +308,7 @@ router.put(
 
       // 3. Apply the new stock movements.
       for (const l of lines) {
-        if (!l.itemId) continue;
+        if (!l.itemId || !liveSet.has(l.itemId)) continue;
         const isSale = type === "SALE";
         await recordStockMovement(tx, {
           businessId,

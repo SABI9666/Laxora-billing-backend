@@ -274,9 +274,10 @@ router.put(
       },
     });
 
-    // Platform admins and the shop's OWNER apply changes immediately; other
-    // roles' edits are held for admin approval.
-    if (user?.isPlatformAdmin || req.memberRole === "OWNER") {
+    // Only the platform admin applies changes immediately. Every shop user's
+    // edit — including the OWNER's — is held for admin approval, so no catalog
+    // change takes effect until the admin approves it.
+    if (user?.isPlatformAdmin) {
       const item = await prisma.item.update({
         where: { id: req.params.id },
         data: req.body,
