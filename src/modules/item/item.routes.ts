@@ -6,7 +6,8 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
-import { requireRole, SHOP_MANAGERS } from "../../middleware/roles";
+import { requireRole, SHOP_MANAGERS, BILLING_ROLES } from "../../middleware/roles";
+import type { Request, Response, NextFunction } from "express";
 
 const router = Router();
 
@@ -15,10 +16,32 @@ const router = Router();
 // GCS_BUCKET env var; on Cloud Run the ambient service account is used.
 const gcsBucket = process.env.GCS_BUCKET || "";
 const gcs = new Storage();
+const MAX_UPLOAD_MB = 15;
 const upload = multer({
   storage: multer.memoryStorage(),
-  limits: { fileSize: 6 * 1024 * 1024 }, // 6 MB
+  limits: { fileSize: MAX_UPLOAD_MB * 1024 * 1024 }, // phone photos are often 8-12 MB
 });
+
+// Runs multer for a single file and converts its errors (e.g. file-too-large)
+// into clear 400s. Without this a too-large upload falls through to the generic
+// 500 "Internal server error", which reads as "upload just failed".
+function uploadSingle(field: string) {
+  return (req: Request, res: Response, next: NextFunction) => {
+    upload.single(field)(req, res, (err: unknown) => {
+      if (err instanceof multer.MulterError) {
+        if (err.code === "LIMIT_FILE_SIZE")
+          return next(
+            badRequest(
+              `This file is too large. Please upload a file under ${MAX_UPLOAD_MB} MB (try a smaller photo or a PDF).`
+            )
+          );
+        return next(badRequest(err.message));
+      }
+      if (err) return next(err);
+      next();
+    });
+  };
+}
 
 const itemSchema = z.object({
   name: z.string().min(1),
@@ -58,12 +81,14 @@ async function assertCategory(businessId: string, categoryId?: string | null) {
 // POST /api/items/upload-image — multipart upload of one product image.
 router.post(
   "/upload-image",
-  requireRole(...SHOP_MANAGERS),
-  upload.single("file"),
+  // Billing staff attach purchase-bill photos while creating invoices, so this
+  // is open to all billing roles, not just managers.
+  requireRole(...BILLING_ROLES),
+  uploadSingle("file"),
   asyncHandler(async (req, res) => {
     if (!gcsBucket)
       throw badRequest(
-        "Image storage is not configured. Set the GCS_BUCKET env var on the backend."
+        "Image storage is not configured on the server (GCS_BUCKET is not set). Please contact support."
       );
     const file = (req as unknown as { file?: Express.Multer.File }).file;
     if (!file) throw badRequest("No file received");
