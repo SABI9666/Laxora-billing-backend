@@ -3,8 +3,9 @@ import { z } from "zod";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
-import { notFound } from "../../utils/errors";
+import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
+import { recomputeInvoiceSettlement } from "../../lib/settlement";
 
 const router = Router();
 
@@ -49,17 +50,34 @@ router.post(
   validateBody(expenseSchema),
   asyncHandler(async (req, res) => {
     const body = req.body as z.infer<typeof expenseSchema>;
-    const expense = await prisma.expense.create({
-      data: {
-        businessId: req.businessId!,
-        category: body.category,
-        amount: body.amount,
-        note: body.note ?? null,
-        invoiceId: body.invoiceId ?? null,
-        method: body.method ?? null,
-        date: body.date ?? new Date(),
-        createdById: req.auth!.userId,
-      },
+    const businessId = req.businessId!;
+
+    if (body.invoiceId) {
+      const invoice = await prisma.invoice.findFirst({
+        where: { id: body.invoiceId, businessId },
+      });
+      if (!invoice) throw badRequest("Invalid invoiceId for this business");
+    }
+
+    const expense = await prisma.$transaction(async (tx) => {
+      const created = await tx.expense.create({
+        data: {
+          businessId,
+          category: body.category,
+          amount: body.amount,
+          note: body.note ?? null,
+          invoiceId: body.invoiceId ?? null,
+          method: body.method ?? null,
+          date: body.date ?? new Date(),
+          createdById: req.auth!.userId,
+        },
+      });
+      // A charge linked to a bill settles part of that bill: bring the bill's
+      // due amount and PAID/PARTIAL status in line everywhere.
+      if (body.invoiceId) {
+        await recomputeInvoiceSettlement(tx, body.invoiceId);
+      }
+      return created;
     });
     res.status(201).json({ expense });
   })
@@ -74,7 +92,13 @@ router.delete(
       where: { id: req.params.id, businessId: req.businessId! },
     });
     if (!existing) throw notFound("Expense not found");
-    await prisma.expense.delete({ where: { id: req.params.id } });
+    await prisma.$transaction(async (tx) => {
+      await tx.expense.delete({ where: { id: existing.id } });
+      // Removing a bill-linked charge restores that bill's due amount.
+      if (existing.invoiceId) {
+        await recomputeInvoiceSettlement(tx, existing.invoiceId);
+      }
+    });
     res.status(204).send();
   })
 );

@@ -52,7 +52,7 @@ router.get(
     const invoiceType = type === "CUSTOMER" ? "SALE" : "PURCHASE";
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
-    const [parties, invAgg, payAgg, cnAgg] = await Promise.all([
+    const [parties, invAgg, payAgg, cnAgg, chargeRows] = await Promise.all([
       prisma.party.findMany({
         where: { businessId, type: type as never },
         orderBy: { name: "asc" },
@@ -72,23 +72,59 @@ router.get(
         where: { businessId },
         _sum: { totalAmount: true },
       }),
+      // Which bills carry linked charges (Expense has no invoice relation, so
+      // we resolve the party through the invoice below).
+      prisma.expense.findMany({
+        where: { businessId, invoiceId: { not: null } },
+        select: { invoiceId: true },
+      }),
     ]);
+
+    // A bill-linked charge settles the bill's due, so it counts as "paid" for
+    // that party — but only for the amount that actually cleared the bill.
+    // amountPaid is already capped at the bill total, so (amountPaid − payments
+    // on that bill) is exactly the settling portion of the charges, never more
+    // than the outstanding. This keeps a charge on a fully-paid bill from
+    // handing the customer a phantom credit.
+    const chargedIds = [...new Set(chargeRows.map((e) => e.invoiceId!))];
+    const adjMap = new Map<string, number>();
+    if (chargedIds.length) {
+      const [chargedInvoices, linkedPayAgg] = await Promise.all([
+        prisma.invoice.findMany({
+          where: { id: { in: chargedIds }, businessId, type: invoiceType as never },
+          select: { id: true, partyId: true, amountPaid: true },
+        }),
+        prisma.payment.groupBy({
+          by: ["invoiceId"],
+          where: { invoiceId: { in: chargedIds } },
+          _sum: { amount: true },
+        }),
+      ]);
+      const linkedPayMap = new Map(
+        linkedPayAgg.map((r) => [r.invoiceId, Number(r._sum.amount ?? 0)])
+      );
+      for (const inv of chargedInvoices) {
+        const settled = Number(inv.amountPaid) - (linkedPayMap.get(inv.id) ?? 0);
+        if (settled <= 0) continue;
+        adjMap.set(inv.partyId, (adjMap.get(inv.partyId) ?? 0) + settled);
+      }
+    }
 
     // Split payments by direction so refunds (opposite direction) don't count as
     // money received. Customers pay IN; supplier payments go OUT.
     const reduceDir = type === "CUSTOMER" ? "IN" : "OUT";
     const invMap = new Map(invAgg.map((r) => [r.partyId, Number(r._sum.total ?? 0)]));
-    const paidMap = new Map<string | null, number>();
+    const payMap = new Map<string | null, number>();
     const refundMap = new Map<string | null, number>();
     for (const r of payAgg) {
-      const map = r.direction === reduceDir ? paidMap : refundMap;
+      const map = r.direction === reduceDir ? payMap : refundMap;
       map.set(r.partyId, (map.get(r.partyId) ?? 0) + Number(r._sum.amount ?? 0));
     }
     const cnMap = new Map(cnAgg.map((r) => [r.partyId, Number(r._sum.totalAmount ?? 0)]));
 
     const rows = parties.map((p) => {
       const billed = invMap.get(p.id) ?? 0;
-      const paid = paidMap.get(p.id) ?? 0;
+      const paid = (payMap.get(p.id) ?? 0) + (adjMap.get(p.id) ?? 0);
       const refunded = refundMap.get(p.id) ?? 0;
       const returns = cnMap.get(p.id) ?? 0;
       return {
@@ -133,17 +169,46 @@ router.get(
     const [invoices, payments, creditNotes] = await Promise.all([
       prisma.invoice.findMany({
         where: { partyId: party.id, businessId, type: invoiceType as never },
-        select: { invoiceNumber: true, invoiceDate: true, total: true },
+        select: { id: true, invoiceNumber: true, invoiceDate: true, total: true, amountPaid: true },
       }),
       prisma.payment.findMany({
         where: { partyId: party.id, businessId },
-        select: { paymentDate: true, amount: true, method: true, direction: true },
+        select: { paymentDate: true, amount: true, method: true, invoiceId: true, direction: true },
       }),
       prisma.creditNote.findMany({
         where: { partyId: party.id, businessId },
         select: { date: true, totalAmount: true, invoiceNumber: true },
       }),
     ]);
+
+    // A payment in the party's usual direction (customer pays IN, we pay a
+    // supplier OUT) reduces what's owed; an opposite-direction payment is a
+    // refund (money going the other way).
+    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
+
+    // Bill-linked charges (commission, damage, …) settle part of the bill, so
+    // they show as credits in the statement just like payments do — each named
+    // by its own category (Commission, Transport, …). We only credit the
+    // portion that actually cleared the bill: amountPaid is capped at the bill
+    // total, so (amountPaid − payments on that bill) is the total settling
+    // charges, never more than the outstanding. When several charges share a
+    // bill we allocate that budget across them in date order.
+    const billCharges = invoices.length
+      ? await prisma.expense.findMany({
+          where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
+          select: { invoiceId: true, date: true, amount: true, category: true },
+        })
+      : [];
+    const chargesByInv = new Map<string, { date: Date; amount: number; category: string }[]>();
+    for (const x of billCharges) {
+      const arr = chargesByInv.get(x.invoiceId!) ?? [];
+      arr.push({ date: x.date, amount: Number(x.amount), category: x.category });
+      chargesByInv.set(x.invoiceId!, arr);
+    }
+    const linkedPaid = new Map<string, number>();
+    for (const p of payments)
+      if (p.invoiceId && p.direction === reduceDir)
+        linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
 
     type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
     const entries: Entry[] = [];
@@ -155,10 +220,6 @@ router.get(
         debit: Number(inv.total),
         credit: 0,
       });
-    // A payment in the party's usual direction (customer pays IN, we pay a
-    // supplier OUT) reduces what's owed (credit). The opposite direction is a
-    // refund — money going the other way — so it's a debit.
-    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
     for (const p of payments) {
       const reduces = p.direction === reduceDir;
       entries.push({
@@ -177,6 +238,25 @@ router.get(
         debit: 0,
         credit: Number(cn.totalAmount),
       });
+    for (const inv of invoices) {
+      const charges = chargesByInv.get(inv.id);
+      if (!charges) continue; // no linked charges on this bill
+      // Total that actually cleared this bill (capped at its outstanding).
+      let budget = Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0);
+      if (budget <= 0) continue;
+      for (const c of [...charges].sort((a, b) => a.date.getTime() - b.date.getTime())) {
+        if (budget <= 0) break;
+        const credit = Math.min(c.amount, budget);
+        budget -= credit;
+        entries.push({
+          date: c.date,
+          kind: `Bill Charge (${c.category})`,
+          ref: inv.invoiceNumber,
+          debit: 0,
+          credit,
+        });
+      }
+    }
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
 
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;

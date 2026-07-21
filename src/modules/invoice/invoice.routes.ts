@@ -7,8 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
-import { deleteInvoiceWithReversal } from "../../lib/invoiceOps";
-import { reverseCreditNote } from "../../lib/returnOps";
+import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 
 const router = Router();
 
@@ -557,12 +556,14 @@ router.get(
   })
 );
 
-// DELETE /api/invoices/:id/return/:creditNoteId — remove a wrong return.
-// Platform admins reverse it immediately. Shop users (owner/staff alike) instead
-// raise a removal request that the admin approves in the admin dashboard, so a
-// wrong return can never be wiped without a sign-off.
+// DELETE /api/invoices/:id/return/:creditNoteId — undo a wrong return.
+// Platform admins reverse it immediately; shop users' undo is held for
+// platform-admin approval (mirrors invoice deletion). On approval the return is
+// reversed: the stock it added back is removed, the returnedQty on each line is
+// freed, and the cash/bank refund voucher (if any) is deleted.
 router.delete(
   "/:id/return/:creditNoteId",
+  requireRole(...BILLING_ROLES),
   asyncHandler(async (req, res) => {
     const businessId = req.businessId!;
     const note = await prisma.creditNote.findFirst({
@@ -575,37 +576,38 @@ router.delete(
       select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
 
+    // Platform admins undo directly; everyone else sends it for approval.
     if (user?.isPlatformAdmin) {
-      await reverseCreditNote(note.id, businessId, req.auth!.userId);
+      await reverseReturn(note.id, businessId, req.auth!.userId);
       return res.json({ ok: true, reversedAmount: Number(note.totalAmount) });
     }
 
     // Don't queue the same return twice.
-    const existing = await prisma.returnRemovalRequest.findFirst({
+    const existing = await prisma.returnDeleteRequest.findFirst({
       where: { creditNoteId: note.id, status: "PENDING" },
     });
     if (existing) {
       return res.status(202).json({
         pending: true,
-        message: "This return is already waiting for admin approval to be removed.",
+        message: "This return is already waiting for admin approval to be deleted.",
       });
     }
 
     const invoice = await prisma.invoice.findFirst({
       where: { id: req.params.id, businessId },
-      select: { party: { select: { name: true } } },
+      include: { party: { select: { name: true } } },
     });
 
-    await prisma.returnRemovalRequest.create({
+    await prisma.returnDeleteRequest.create({
       data: {
         businessId,
         creditNoteId: note.id,
-        invoiceId: note.invoiceId ?? req.params.id,
-        invoiceNumber: note.invoiceNumber ?? "",
+        invoiceId: note.invoiceId,
+        invoiceNumber: note.invoiceNumber,
         partyName: invoice?.party?.name ?? null,
-        total: note.totalAmount,
-        refundMethod: note.refundMethod ?? null,
-        reason: (req.query.reason as string) || (req.body?.reason as string) || null,
+        amount: note.totalAmount,
+        refundMethod: note.refundMethod,
+        reason: note.reason,
         requestedById: req.auth!.userId,
         requestedByName: user?.name ?? user?.username ?? user?.email ?? null,
       },
@@ -613,7 +615,8 @@ router.delete(
 
     res.status(202).json({
       pending: true,
-      message: "Sent to the admin for approval. The return stays until an admin approves it.",
+      message:
+        "Return deletion sent to the admin for approval. The return stays until approved.",
     });
   })
 );

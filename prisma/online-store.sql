@@ -61,16 +61,16 @@ ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "lines" JSONB;
 ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundMethod" TEXT;
 ALTER TABLE "CreditNote" ADD COLUMN IF NOT EXISTS "refundPaymentId" TEXT;
 
--- 10. Return-removal approval queue: a shop asks to remove a wrong return,
+-- 10. Return-deletion approval queue: a shop asks to remove a wrong return,
 --     the admin approves/rejects it in the admin dashboard.
-CREATE TABLE IF NOT EXISTS "ReturnRemovalRequest" (
+CREATE TABLE IF NOT EXISTS "ReturnDeleteRequest" (
   "id" TEXT NOT NULL,
   "businessId" TEXT NOT NULL,
   "creditNoteId" TEXT NOT NULL,
-  "invoiceId" TEXT NOT NULL,
-  "invoiceNumber" TEXT NOT NULL,
+  "invoiceId" TEXT,
+  "invoiceNumber" TEXT,
   "partyName" TEXT,
-  "total" DECIMAL(14,2) NOT NULL DEFAULT 0,
+  "amount" DECIMAL(14,2) NOT NULL DEFAULT 0,
   "refundMethod" TEXT,
   "reason" TEXT,
   "status" TEXT NOT NULL DEFAULT 'PENDING',
@@ -78,15 +78,16 @@ CREATE TABLE IF NOT EXISTS "ReturnRemovalRequest" (
   "requestedByName" TEXT,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "reviewedAt" TIMESTAMP(3),
-  "reviewedByName" TEXT,
-  CONSTRAINT "ReturnRemovalRequest_pkey" PRIMARY KEY ("id"),
-  CONSTRAINT "ReturnRemovalRequest_businessId_fkey" FOREIGN KEY ("businessId")
+  CONSTRAINT "ReturnDeleteRequest_pkey" PRIMARY KEY ("id"),
+  CONSTRAINT "ReturnDeleteRequest_businessId_fkey" FOREIGN KEY ("businessId")
     REFERENCES "Business"("id") ON DELETE CASCADE ON UPDATE CASCADE
 );
-CREATE INDEX IF NOT EXISTS "ReturnRemovalRequest_status_idx"
-  ON "ReturnRemovalRequest"("status");
-CREATE INDEX IF NOT EXISTS "ReturnRemovalRequest_creditNoteId_idx"
-  ON "ReturnRemovalRequest"("creditNoteId");
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_businessId_idx"
+  ON "ReturnDeleteRequest"("businessId");
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_status_idx"
+  ON "ReturnDeleteRequest"("status");
+CREATE INDEX IF NOT EXISTS "ReturnDeleteRequest_creditNoteId_idx"
+  ON "ReturnDeleteRequest"("creditNoteId");
 
 -- 7. Activity log for the dashboard's per-day entry counts (product edits).
 CREATE TABLE IF NOT EXISTS "ActivityLog" (
