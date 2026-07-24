@@ -28,6 +28,8 @@ const invoiceSchema = z.object({
   notes: z.string().optional(),
   // Uploaded bill document (supplier purchase bill), image or PDF URL.
   attachmentUrl: z.string().optional().nullable(),
+  attachmentUrl2: z.string().optional().nullable(),
+  attachmentUrl3: z.string().optional().nullable(),
   // When true, each line's rate is treated as GST-inclusive: the tax is split
   // out so the stored rate/amount are ex-GST and the total equals the entered
   // (gross) price.
@@ -176,6 +178,8 @@ router.post(
           total,
           notes: body.notes ?? null,
           attachmentUrl: body.attachmentUrl ?? null,
+          attachmentUrl2: body.attachmentUrl2 ?? null,
+          attachmentUrl3: body.attachmentUrl3 ?? null,
           items: {
             create: lines.map((l) => ({
               itemId: l.itemId ?? null,
@@ -308,6 +312,8 @@ router.put(
           status,
           notes: body.notes ?? null,
           attachmentUrl: body.attachmentUrl ?? null,
+          attachmentUrl2: body.attachmentUrl2 ?? null,
+          attachmentUrl3: body.attachmentUrl3 ?? null,
           items: {
             create: lines.map((l) => ({
               itemId: l.itemId ?? null,
