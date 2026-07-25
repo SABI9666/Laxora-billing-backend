@@ -265,8 +265,11 @@ model Invoice {
   // External reference for online orders (website order id) — used to make
   // order syncing idempotent so the same order never bills twice.
   externalRef   String?
-  // Uploaded bill document (e.g. the supplier's purchase bill), image or PDF.
-  attachmentUrl String?
+  // Uploaded bill documents (e.g. the supplier's purchase bill), image or PDF.
+  // Up to three can be attached.
+  attachmentUrl  String?
+  attachmentUrl2 String?
+  attachmentUrl3 String?
   invoiceDate   DateTime      @default(now())
   dueDate       DateTime?
   subtotal      Decimal       @default(0) @db.Decimal(14, 2)
