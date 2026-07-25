@@ -58,10 +58,13 @@ router.get(
         orderBy: { createdAt: "desc" },
       });
     } catch (err: unknown) {
-      // TEMP diagnostic: surface the real reason the list can't load.
+      // TEMP diagnostic: surface the real reason the list can't load, right in
+      // the error message so it shows in the browser console.
       const msg = err instanceof Error ? err.message : String(err);
       console.error("GET /invoices findMany failed:", err);
-      return res.status(500).json({ error: "invoice list failed", detail: msg });
+      return res
+        .status(500)
+        .json({ error: "INVOICE ERROR >>> " + msg.replace(/\s+/g, " ").slice(0, 800), detail: msg });
     }
 
     // Per-bill profit for SALE invoices: ex-GST net revenue (subtotal −
