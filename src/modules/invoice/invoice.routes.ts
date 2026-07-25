@@ -60,38 +60,44 @@ router.get(
     // discount) minus ex-GST cost of goods (purchase price is GST-inclusive).
     const saleIds = invoices.filter((i) => i.type === "SALE").map((i) => i.id);
     const profitMap = new Map<string, number>();
+    // Profit is a nice-to-have: never let a problem computing it (bad data,
+    // a divide-by-zero tax rate, etc.) crash the whole invoice list.
     if (saleIds.length) {
-      const cogsRows = await prisma.$queryRaw<Array<{ invoiceid: string; cogs: number }>>(
-        Prisma.sql`
-          SELECT ii."invoiceId" AS invoiceid,
-                 COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float AS cogs
-          FROM "InvoiceItem" ii
-          JOIN "Item" i ON i.id = ii."itemId"
-          WHERE ii."invoiceId" IN (${Prisma.join(saleIds)})
-          GROUP BY 1
-        `
-      );
-      const cogsMap = new Map(cogsRows.map((r) => [r.invoiceid, Number(r.cogs)]));
+      try {
+        const cogsRows = await prisma.$queryRaw<Array<{ invoiceid: string; cogs: number }>>(
+          Prisma.sql`
+            SELECT ii."invoiceId" AS invoiceid,
+                   COALESCE(SUM(ii.quantity * i."purchasePrice" / NULLIF(1 + i."taxRate" / 100, 0)), 0)::float AS cogs
+            FROM "InvoiceItem" ii
+            JOIN "Item" i ON i.id = ii."itemId"
+            WHERE ii."invoiceId" IN (${Prisma.join(saleIds)})
+            GROUP BY 1
+          `
+        );
+        const cogsMap = new Map(cogsRows.map((r) => [r.invoiceid, Number(r.cogs)]));
 
-      // Charges booked against a bill (commission, electrician, damage, …)
-      // are real costs on that sale, so they cut into its profit.
-      const expenseRows = await prisma.expense.groupBy({
-        by: ["invoiceId"],
-        where: { businessId: req.businessId!, invoiceId: { in: saleIds } },
-        _sum: { amount: true },
-      });
-      const expenseMap = new Map(
-        expenseRows.map((r) => [r.invoiceId, Number(r._sum.amount ?? 0)])
-      );
+        // Charges booked against a bill (commission, electrician, damage, …)
+        // are real costs on that sale, so they cut into its profit.
+        const expenseRows = await prisma.expense.groupBy({
+          by: ["invoiceId"],
+          where: { businessId: req.businessId!, invoiceId: { in: saleIds } },
+          _sum: { amount: true },
+        });
+        const expenseMap = new Map(
+          expenseRows.map((r) => [r.invoiceId, Number(r._sum.amount ?? 0)])
+        );
 
-      for (const inv of invoices) {
-        if (inv.type !== "SALE") continue;
-        const profit =
-          Number(inv.subtotal) -
-          Number(inv.discount) -
-          (cogsMap.get(inv.id) ?? 0) -
-          (expenseMap.get(inv.id) ?? 0);
-        profitMap.set(inv.id, Math.round((profit + Number.EPSILON) * 100) / 100);
+        for (const inv of invoices) {
+          if (inv.type !== "SALE") continue;
+          const profit =
+            Number(inv.subtotal) -
+            Number(inv.discount) -
+            (cogsMap.get(inv.id) ?? 0) -
+            (expenseMap.get(inv.id) ?? 0);
+          profitMap.set(inv.id, Math.round((profit + Number.EPSILON) * 100) / 100);
+        }
+      } catch (err) {
+        console.error("invoice profit calc failed (list still returned):", err);
       }
     }
 
