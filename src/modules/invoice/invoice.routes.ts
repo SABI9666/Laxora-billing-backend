@@ -123,7 +123,7 @@ router.get(
       where: { id: req.params.id, businessId: req.businessId! },
       include: {
         // Include the linked product's HSN and unit for the tax-invoice print.
-        items: { include: { item: { select: { hsn: true, unit: true } } } },
+        items: { include: { item: { select: { hsn: true, unit: true, sku: true } } } },
         party: true,
         payments: true,
       },

@@ -157,11 +157,19 @@ router.get(
   asyncHandler(async (req, res) => {
     const { barcode, sku } = req.query;
     if (!barcode && !sku) throw badRequest("barcode or sku is required");
+    const code = String(barcode ?? sku ?? "").trim();
+    // A bare product number ("9" or "009") matches codes like "BULB-009".
+    const num = /^\d+$/.test(code) ? code.padStart(3, "0") : null;
     const item = await prisma.item.findFirst({
       where: {
         businessId: req.businessId!,
-        ...(barcode ? { barcode: String(barcode) } : {}),
-        ...(sku ? { sku: String(sku) } : {}),
+        OR: [
+          { barcode: code },
+          { sku: { equals: code, mode: "insensitive" } },
+          ...(num
+            ? [{ sku: { endsWith: `-${num}` } }, { sku: num }]
+            : []),
+        ],
       },
       include: { category: { select: { id: true, name: true, parentId: true } }, supplier: { select: { id: true, name: true } } },
     });
