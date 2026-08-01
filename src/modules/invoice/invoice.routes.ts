@@ -44,25 +44,17 @@ router.get(
   "/",
   asyncHandler(async (req, res) => {
     const { type, partyId, status, channel } = req.query;
-    let invoices;
-    try {
-      invoices = await prisma.invoice.findMany({
-        where: {
-          businessId: req.businessId!,
-          ...(type ? { type: type as "SALE" | "PURCHASE" } : {}),
-          ...(partyId ? { partyId: String(partyId) } : {}),
-          ...(status ? { status: status as never } : {}),
-          ...(channel ? { channel: channel as "POS" | "ONLINE" } : {}),
-        },
-        include: { party: { select: { id: true, name: true } } },
-        orderBy: { createdAt: "desc" },
-      });
-    } catch (err: unknown) {
-      // TEMP diagnostic: surface the real reason the list can't load.
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("GET /invoices findMany failed:", err);
-      return res.status(500).json({ error: "invoice list failed", detail: msg });
-    }
+    const invoices = await prisma.invoice.findMany({
+      where: {
+        businessId: req.businessId!,
+        ...(type ? { type: type as "SALE" | "PURCHASE" } : {}),
+        ...(partyId ? { partyId: String(partyId) } : {}),
+        ...(status ? { status: status as never } : {}),
+        ...(channel ? { channel: channel as "POS" | "ONLINE" } : {}),
+      },
+      include: { party: { select: { id: true, name: true } } },
+      orderBy: { createdAt: "desc" },
+    });
 
     // Per-bill profit for SALE invoices: ex-GST net revenue (subtotal −
     // discount) minus ex-GST cost of goods (purchase price is GST-inclusive).
