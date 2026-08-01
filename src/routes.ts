@@ -13,6 +13,7 @@ import invoiceRoutes from "./modules/invoice/invoice.routes";
 import paymentRoutes from "./modules/payment/payment.routes";
 import expenseRoutes from "./modules/expense/expense.routes";
 import dashboardRoutes from "./modules/dashboard/dashboard.routes";
+import reportRoutes from "./modules/report/report.routes";
 import franchiseRoutes from "./modules/franchise/franchise.routes";
 import onlineStoreRoutes from "./modules/integration/onlineStore.routes";
 
@@ -42,5 +43,6 @@ api.use("/invoices", invoiceRoutes);
 api.use("/payments", paymentRoutes);
 api.use("/expenses", expenseRoutes);
 api.use("/dashboard", dashboardRoutes);
+api.use("/reports", reportRoutes);
 
 export default api;
