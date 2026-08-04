@@ -75,9 +75,20 @@ router.get(
     const todayStart = new Date(
       Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), ist.getUTCDate()) - IST_MS
     );
-    const monthStart = new Date(
-      Date.UTC(ist.getUTCFullYear(), ist.getUTCMonth(), 1) - IST_MS
-    );
+    // Reporting period for the stat cards: month (default), quarter (Apr–Jun,
+    // Jul–Sep, Oct–Dec, Jan–Mar) or year (financial year, Apr–Mar).
+    const period = String(req.query.period || "month");
+    const y = ist.getUTCFullYear();
+    const m = ist.getUTCMonth();
+    let periodStart: Date;
+    if (period === "quarter") {
+      periodStart = new Date(Date.UTC(y, Math.floor(m / 3) * 3, 1) - IST_MS);
+    } else if (period === "year") {
+      // Indian financial year: starts 1 April.
+      periodStart = new Date(Date.UTC(m >= 3 ? y : y - 1, 3, 1) - IST_MS);
+    } else {
+      periodStart = new Date(Date.UTC(y, m, 1) - IST_MS);
+    }
     const weekStart = new Date(todayStart.getTime() - 6 * 24 * 3600 * 1000);
 
     // Sales + cash-out pieces for a period → profit (net revenue is ex-GST;
@@ -144,7 +155,7 @@ router.get(
       weekExpenses,
     ] = await Promise.all([
       profitFor(todayStart),
-      profitFor(monthStart),
+      profitFor(periodStart),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", invoiceDate: { gte: weekStart } },
         select: { invoiceDate: true, total: true, channel: true },
@@ -275,7 +286,10 @@ router.get(
     res.json({
       overview: {
         today,
+        // Selected period's figures (kept under `month` for compatibility).
         month,
+        period,
+        periodStart,
         pending: {
           toReceive: round2(recv.reduce((s, d) => s + d, 0)),
           receivableBills: recv.length,
