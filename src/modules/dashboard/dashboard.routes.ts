@@ -98,6 +98,15 @@ router.get(
     }
     const weekStart = new Date(todayStart.getTime() - 6 * 24 * 3600 * 1000);
 
+    // Previous equivalent period (last month / last quarter / last FY) so the
+    // cards can show "this vs last" side by side.
+    const monthsBack = period === "quarter" ? 3 : period === "year" ? 12 : 1;
+    const psIst = new Date(periodStart.getTime() + IST_MS);
+    const prevStart = new Date(
+      Date.UTC(psIst.getUTCFullYear(), psIst.getUTCMonth() - monthsBack, 1) - IST_MS
+    );
+    const prevEnd = periodStart;
+
     // Sales + cash-out pieces for a period → profit (net revenue is ex-GST;
     // COGS is de-grossed to ex-GST to match; expenses subtract fully).
     // Service/other income (credit vouchers, e.g. LED service) is added on top
@@ -153,6 +162,7 @@ router.get(
     const [
       today,
       month,
+      prev,
       weekSales,
       receivables,
       payables,
@@ -165,6 +175,7 @@ router.get(
     ] = await Promise.all([
       profitFor(todayStart),
       profitFor(periodStart, periodEnd),
+      profitFor(prevStart, prevEnd),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", invoiceDate: { gte: weekStart } },
         select: { invoiceDate: true, total: true, channel: true },
@@ -297,6 +308,8 @@ router.get(
         today,
         // Selected period's figures (kept under `month` for compatibility).
         month,
+        // Previous equivalent period, for the this-vs-last comparison.
+        prev,
         period,
         periodStart,
         pending: {
