@@ -81,11 +81,18 @@ router.get(
     const y = ist.getUTCFullYear();
     const m = ist.getUTCMonth();
     let periodStart: Date;
+    let periodEnd: Date | undefined;
+    const monthParam = String(req.query.month || "");
     if (period === "quarter") {
       periodStart = new Date(Date.UTC(y, Math.floor(m / 3) * 3, 1) - IST_MS);
     } else if (period === "year") {
       // Indian financial year: starts 1 April.
       periodStart = new Date(Date.UTC(m >= 3 ? y : y - 1, 3, 1) - IST_MS);
+    } else if (/^\d{4}-\d{2}$/.test(monthParam)) {
+      // A specific month (e.g. 2026-06): bounded start → end of that month.
+      const [my, mm] = monthParam.split("-").map(Number);
+      periodStart = new Date(Date.UTC(my, mm - 1, 1) - IST_MS);
+      periodEnd = new Date(Date.UTC(my, mm, 1) - IST_MS);
     } else {
       periodStart = new Date(Date.UTC(y, m, 1) - IST_MS);
     }
@@ -95,10 +102,11 @@ router.get(
     // COGS is de-grossed to ex-GST to match; expenses subtract fully).
     // Service/other income (credit vouchers, e.g. LED service) is added on top
     // of sales — it has no COGS, so the full amount is profit.
-    const profitFor = async (from: Date) => {
+    const profitFor = async (from: Date, to?: Date) => {
+      const range = to ? { gte: from, lt: to } : { gte: from };
       const [rev, cogsRows, exp, svc] = await Promise.all([
         prisma.invoice.aggregate({
-          where: { businessId, type: "SALE", invoiceDate: { gte: from } },
+          where: { businessId, type: "SALE", invoiceDate: range },
           _sum: { subtotal: true, discount: true, total: true },
           _count: true,
         }),
@@ -110,9 +118,10 @@ router.get(
           WHERE inv."businessId" = ${businessId}
             AND inv.type = 'SALE'
             AND inv."invoiceDate" >= ${from}
+            ${to ? Prisma.sql`AND inv."invoiceDate" < ${to}` : Prisma.empty}
         `),
         prisma.expense.aggregate({
-          where: { businessId, date: { gte: from } },
+          where: { businessId, date: range },
           _sum: { amount: true },
         }),
         prisma.payment.aggregate({
@@ -120,7 +129,7 @@ router.get(
             businessId,
             direction: "IN",
             purpose: { in: INCOME_PURPOSE_LIST },
-            paymentDate: { gte: from },
+            paymentDate: range,
           },
           _sum: { amount: true },
         }),
@@ -155,7 +164,7 @@ router.get(
       weekExpenses,
     ] = await Promise.all([
       profitFor(todayStart),
-      profitFor(periodStart),
+      profitFor(periodStart, periodEnd),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", invoiceDate: { gte: weekStart } },
         select: { invoiceDate: true, total: true, channel: true },
