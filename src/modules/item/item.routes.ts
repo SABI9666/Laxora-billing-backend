@@ -244,6 +244,127 @@ router.get(
   })
 );
 
+// GET /api/items/:id/history — the product's full life: every time it was
+// sold and purchased (date, bill number, customer/supplier, qty, rate,
+// amount) plus other stock changes (returns, adjustments, transfers,
+// opening stock) and summary totals.
+router.get(
+  "/:id/history",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const item = await prisma.item.findFirst({
+      where: { id: req.params.id, businessId },
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        unit: true,
+        stockQty: true,
+        isService: true,
+        supplier: { select: { name: true } },
+      },
+    });
+    if (!item) throw notFound("Item not found");
+
+    const [lines, moves] = await Promise.all([
+      prisma.invoiceItem.findMany({
+        where: { itemId: item.id, invoice: { businessId } },
+        select: {
+          quantity: true,
+          rate: true,
+          taxRate: true,
+          amount: true,
+          invoice: {
+            select: {
+              id: true,
+              invoiceNumber: true,
+              invoiceDate: true,
+              type: true,
+              channel: true,
+              status: true,
+              party: { select: { name: true } },
+            },
+          },
+        },
+        orderBy: { invoice: { invoiceDate: "desc" } },
+        take: 500,
+      }),
+      prisma.stockMovement.findMany({
+        where: { itemId: item.id, businessId },
+        orderBy: { createdAt: "desc" },
+        take: 300,
+      }),
+    ]);
+
+    const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+    const mapLine = (l: (typeof lines)[number]) => ({
+      date: l.invoice.invoiceDate,
+      invoiceId: l.invoice.id,
+      invoiceNumber: l.invoice.invoiceNumber,
+      party: l.invoice.party?.name ?? "—",
+      quantity: Number(l.quantity),
+      rate: round2(Number(l.rate)),
+      taxRate: Number(l.taxRate),
+      amount: round2(Number(l.amount)),
+      channel: l.invoice.channel,
+      status: l.invoice.status,
+    });
+    const sales = lines.filter((l) => l.invoice.type === "SALE").map(mapLine);
+    const purchases = lines.filter((l) => l.invoice.type === "PURCHASE").map(mapLine);
+
+    // Other stock changes: returns, adjustments, transfers, opening stock.
+    // Bill lines ("Sale"/"Purchase") are already listed above, and the
+    // reverse-and-reapply churn of bill edits is noise, so both are skipped.
+    const other = moves
+      .filter(
+        (m) =>
+          m.reason !== "Sale" &&
+          m.reason !== "Purchase" &&
+          !(m.reason ?? "").startsWith("Edit ") &&
+          !(m.reason ?? "").startsWith("Edit reversal ")
+      )
+      .slice(0, 100)
+      .map((m) => ({
+        date: m.createdAt,
+        type: m.type,
+        quantity: Number(m.quantity),
+        balanceAfter: Number(m.balanceAfter),
+        reason: m.reason,
+        reference: m.reference,
+      }));
+
+    const sum = (rows: { quantity: number }[]) =>
+      round2(rows.reduce((s, r) => s + r.quantity, 0));
+    const sumAmt = (rows: { amount: number }[]) =>
+      round2(rows.reduce((s, r) => s + r.amount, 0));
+
+    res.json({
+      item: {
+        id: item.id,
+        name: item.name,
+        sku: item.sku,
+        unit: item.unit,
+        stockQty: Number(item.stockQty),
+        isService: item.isService,
+        supplier: item.supplier?.name ?? null,
+      },
+      summary: {
+        soldQty: sum(sales),
+        soldAmount: sumAmt(sales),
+        soldBills: sales.length,
+        lastSoldAt: sales[0]?.date ?? null,
+        purchasedQty: sum(purchases),
+        purchasedAmount: sumAmt(purchases),
+        purchasedBills: purchases.length,
+        lastPurchasedAt: purchases[0]?.date ?? null,
+      },
+      sales,
+      purchases,
+      other,
+    });
+  })
+);
+
 // POST /api/items
 router.post(
   "/",
