@@ -359,6 +359,16 @@ router.put(
       return updated;
     });
 
+    // Count this edit in the per-day activity / time-worked reports.
+    await prisma.activityLog.create({
+      data: {
+        businessId,
+        type: "INVOICE_EDIT",
+        refId: existing.id,
+        userId: req.auth!.userId,
+      },
+    });
+
     res.json({ invoice });
   })
 );
