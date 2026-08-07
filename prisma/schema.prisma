@@ -99,6 +99,7 @@ model Business {
   deleteRequests InvoiceDeleteRequest[]
   returnDeleteRequests ReturnDeleteRequest[]
   activityLogs   ActivityLog[]
+  appUsage       AppUsage[]
 
   @@index([franchiseId])
 }
@@ -537,4 +538,27 @@ model ReturnDeleteRequest {
   @@index([businessId])
   @@index([status])
   @@index([creditNoteId])
+}
+
+// ----------------------------------------------------------------------------
+// App usage — how long the application was actually open and worked in.
+// One row per user per shop per IST day; the frontend sends a heartbeat every
+// minute while its tab is visible and the seconds accumulate here.
+// ----------------------------------------------------------------------------
+
+model AppUsage {
+  id         String   @id @default(cuid())
+  businessId String
+  business   Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  userId     String
+  // IST calendar day, "YYYY-MM-DD".
+  day        String
+  // Seconds the app was open (visible tab) on this day.
+  seconds    Int      @default(0)
+  lastPingAt DateTime @default(now())
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([businessId, userId, day])
+  @@index([businessId, day])
 }

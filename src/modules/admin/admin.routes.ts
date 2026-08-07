@@ -1258,28 +1258,62 @@ router.get(
       let credit = 0,
         debit = 0,
         cashDelta = 0,
-        bankDelta = 0;
+        bankDelta = 0,
+        inCash = 0,
+        inBank = 0,
+        outCash = 0,
+        outBank = 0,
+        // Cash handed into the bank / cash drawn out of the bank.
+        toBank = 0,
+        toCash = 0;
       for (const r of rows) {
+        // Cash deposit: shop cash goes down, bank goes up by the same amount.
         if (r.purpose === "Bank Deposit") {
           cashDelta -= r.amt;
           bankDelta += r.amt;
+          toBank += r.amt;
           continue;
         }
+        // Bank withdrawal: bank goes down, shop cash goes up.
         if (r.purpose === "Bank Withdrawal") {
           bankDelta -= r.amt;
           cashDelta += r.amt;
+          toCash += r.amt;
           continue;
         }
         const cash = r.method === "CASH";
         if (r.direction === "IN") {
           credit += r.amt;
-          cash ? (cashDelta += r.amt) : (bankDelta += r.amt);
+          if (cash) {
+            cashDelta += r.amt;
+            inCash += r.amt;
+          } else {
+            bankDelta += r.amt;
+            inBank += r.amt;
+          }
         } else {
           debit += r.amt;
-          cash ? (cashDelta -= r.amt) : (bankDelta -= r.amt);
+          if (cash) {
+            cashDelta -= r.amt;
+            outCash += r.amt;
+          } else {
+            bankDelta -= r.amt;
+            outBank += r.amt;
+          }
         }
       }
-      return { credit, debit, cashDelta, bankDelta };
+      return {
+        credit,
+        debit,
+        cashDelta,
+        bankDelta,
+        inCash,
+        inBank,
+        outCash,
+        outBank,
+        toBank,
+        toCash,
+      };
     };
 
     const [beforeRows, rangeRows, receivableInvoices, payableInvoices, creditNotes] =
@@ -1392,16 +1426,28 @@ router.get(
       list.push(asExpenseFlow(r));
       byDay.set(r.day, list);
     }
+    // Period totals of cash <-> bank transfers, for the balance cards.
+    let toBankTotal = 0,
+      toCashTotal = 0;
     const days = Array.from(byDay.keys())
       .sort()
       .map((day) => {
         const f = flows(byDay.get(day)!);
         cash += f.cashDelta;
         bank += f.bankDelta;
+        toBankTotal += f.toBank;
+        toCashTotal += f.toCash;
         return {
           day,
           credit: round2(f.credit),
           debit: round2(f.debit),
+          inCash: round2(f.inCash),
+          inBank: round2(f.inBank),
+          outCash: round2(f.outCash),
+          outBank: round2(f.outBank),
+          // Cash deposited into the bank / withdrawn back as cash that day.
+          toBank: round2(f.toBank),
+          toCash: round2(f.toCash),
           cashBalance: round2(cash),
           bankBalance: round2(bank),
         };
@@ -1413,6 +1459,8 @@ router.get(
       openingBank,
       cashBalance: round2(cash),
       bankBalance: round2(bank),
+      depositedToBank: round2(toBankTotal),
+      withdrawnToCash: round2(toCashTotal),
       toReceive: round2(receivables.reduce((s, b) => s + b.due, 0)),
       toPay: round2(payables.reduce((s, b) => s + b.due, 0)),
       days,
