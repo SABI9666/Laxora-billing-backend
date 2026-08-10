@@ -210,7 +210,7 @@ router.get(
     const [sales, purchases] = await Promise.all([
       prisma.invoice.aggregate({
         where: { businessId: id, type: "SALE", ...filter },
-        _sum: { total: true, amountPaid: true, taxAmount: true },
+        _sum: { total: true, amountPaid: true, taxAmount: true, subtotal: true, discount: true },
         _count: true,
       }),
       prisma.invoice.aggregate({
@@ -220,10 +220,13 @@ router.get(
       }),
     ]);
 
-    // P&L is on a CASH basis: revenue = what was actually collected
-    // (amountPaid), so it updates as payments are recorded and reflects the
-    // final settled amount. Tax inside the collected amount is excluded, and
-    // cost of goods sold is subtracted. Purchase prices are entered GST-
+    // The P&L is on an ACCRUAL basis (standard accounting): revenue is
+    // recognised when a bill is raised — subtotal − discount, i.e. ex-GST —
+    // and the cost of the goods on that bill is recognised with it (matching
+    // principle). Whether the customer has paid yet does not change profit;
+    // collections and the outstanding receivable are reported separately in
+    // the "Collections" section. GST is a pass-through liability and is
+    // excluded from income entirely. Purchase prices are entered GST-
     // inclusive, so COGS is divided by (1 + taxRate/100) to make it ex-GST —
     // matching ex-GST net sales — for an exact gross profit.
     const conditions = [
@@ -236,16 +239,11 @@ router.get(
     // Cash actually received = customer payments only, read straight from the
     // Payment table. A bill-linked charge settles the bill's due (it is inside
     // amountPaid) but is NOT customer cash — it is booked as an expense further
-    // down. Sourcing revenue from payments keeps cash-basis revenue and
-    // realised tax to real money in, and stops the charge being counted as both
-    // income and cost.
-    const realizedRows = await prisma.$queryRaw<Array<{ collected: number; tax: number }>>(Prisma.sql`
-      SELECT COALESCE(SUM(pm.paid), 0)::float AS collected,
-             COALESCE(SUM(inv."taxAmount" * pm.paid / NULLIF(inv.total, 0)), 0)::float AS tax
-      FROM "Invoice" inv
-      LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
-      ) pm ON true
+    // down. This feeds the Collections section, not profit.
+    const collectedRows = await prisma.$queryRaw<Array<{ collected: number }>>(Prisma.sql`
+      SELECT COALESCE(SUM(p.amount), 0)::float AS collected
+      FROM "Payment" p
+      JOIN "Invoice" inv ON inv.id = p."invoiceId"
       WHERE ${Prisma.join(conditions, " AND ")}
     `);
     const cogsRows = await prisma.$queryRaw<Array<{ cogs: number }>>(Prisma.sql`
@@ -255,17 +253,16 @@ router.get(
       JOIN "Item" i ON i.id = ii."itemId"
       WHERE ${Prisma.join(conditions, " AND ")}
     `);
-    const cogs = Number(cogsRows[0]?.cogs ?? 0);
+    const grossCogs = Number(cogsRows[0]?.cogs ?? 0);
 
-    const salesGross = Number(sales._sum.total ?? 0); // total billed
+    const salesGross = Number(sales._sum.total ?? 0); // total billed incl GST
+    const grossSales =
+      Number(sales._sum.subtotal ?? 0) - Number(sales._sum.discount ?? 0); // ex-GST revenue billed
+    const gstBilled = Number(sales._sum.taxAmount ?? 0); // GST payable on sales
     // amountPaid includes bill-linked charges (they settle the due); use it for
-    // the receivable, but use the charge-free "collected" for cash revenue.
+    // the receivable, but use the charge-free "collected" for real cash in.
     const amountSettled = Number(sales._sum.amountPaid ?? 0); // payments + charges
-    const amountCollected = Number(realizedRows[0]?.collected ?? 0); // real cash in
-    const taxCollected = Number(realizedRows[0]?.tax ?? 0);
-    const netRevenue = amountCollected - taxCollected; // realised sales, ex-tax
-    const grossProfit = netRevenue - cogs;
-    const outstanding = salesGross - amountSettled; // still to be received
+    const amountCollected = Number(collectedRows[0]?.collected ?? 0); // real cash in
 
     // Expenses / charges (commission, damage, returns, etc.) reduce profit.
     const expConditions = [Prisma.sql`"businessId" = ${id}`];
@@ -324,29 +321,33 @@ router.get(
     const serviceIncome = Number(svcTotalRows[0]?.total ?? 0);
     const svcByMonth = new Map(monthlySvcRows.map((r) => [r.month, Number(r.inc)]));
 
-    // Apply returns: reduce net revenue and cost of goods.
+    // Returns (credit notes) reverse revenue and the cost of the goods that
+    // came back — both sides of the original sale are backed out.
     const returnsNet = Number(retTotalRows[0]?.net ?? 0);
     const returnsCogs = Number(retTotalRows[0]?.cogs ?? 0);
     const returnsTotal = returnsNet + Number(retTotalRows[0]?.tax ?? 0);
-    const adjNetRevenue = netRevenue - returnsNet;
-    const adjCogs = cogs - returnsCogs;
-    const adjGrossProfit = adjNetRevenue - adjCogs;
+    const netSales = grossSales - returnsNet; // ex-GST revenue, net of returns
+    const netCogs = grossCogs - returnsCogs; // cost matched to goods kept sold
+    const grossProfitAmt = netSales - netCogs;
     // Service income has no cost of goods, so it flows straight into net profit.
-    const netProfit = adjGrossProfit + serviceIncome - totalExpenses;
+    const netProfit = grossProfitAmt + serviceIncome - totalExpenses;
     // Total income (sales + service) — used as the denominator for net margin so
     // service-only shops still get a meaningful percentage.
-    const totalIncome = adjNetRevenue + serviceIncome;
+    const totalIncome = netSales + serviceIncome;
+    // Receivable still open: billed − settled (payments + bill-linked charges)
+    // − credit-note value (a return reduces what the customer owes).
+    const outstanding = Math.max(0, salesGross - amountSettled - returnsTotal);
     const retByMonth = new Map(
       monthlyRetRows.map((r) => [r.month, { net: Number(r.net), cogs: Number(r.cogs) }])
     );
 
-    // Monthly profit/loss, cash basis, net of expenses.
+    // Monthly profit/loss, accrual basis: revenue and matched COGS land in the
+    // month the bill was raised; returns land in the month of the credit note.
     const monthlyRows = await prisma.$queryRaw<
-      Array<{ month: string; collected: number; taxrealized: number; cogs: number }>
+      Array<{ month: string; net: number; cogs: number }>
     >(Prisma.sql`
       SELECT to_char(date_trunc('month', inv."invoiceDate"), 'YYYY-MM') AS month,
-             COALESCE(SUM(pm.paid), 0)::float AS collected,
-             COALESCE(SUM(inv."taxAmount" * pm.paid / NULLIF(inv.total, 0)), 0)::float AS taxrealized,
+             COALESCE(SUM(inv.subtotal - inv.discount), 0)::float AS net,
              COALESCE(SUM(c.cost), 0)::float AS cogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -354,9 +355,6 @@ router.get(
         FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
         WHERE ii."invoiceId" = inv.id
       ) c ON true
-      LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
-      ) pm ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       GROUP BY 1
     `);
@@ -364,10 +362,7 @@ router.get(
     // Merge sales-derived months with expense-only months.
     const salesByMonth = new Map<string, { net: number; cogs: number }>();
     for (const m of monthlyRows) {
-      salesByMonth.set(m.month, {
-        net: Number(m.collected) - Number(m.taxrealized),
-        cogs: Number(m.cogs),
-      });
+      salesByMonth.set(m.month, { net: Number(m.net), cogs: Number(m.cogs) });
     }
     const allMonths = new Set<string>([
       ...salesByMonth.keys(),
@@ -395,25 +390,36 @@ router.get(
       });
 
     // Per-bill profit/loss (most recent 100 sales) incl. charges on that bill.
+    // Same accrual formula as the single-bill P&L modal, so a row and its
+    // detail view always agree: net sale (ex-GST, after discount and returns)
+    // − matched COGS − bill-linked charges. Collection status rides along.
     const billRows = await prisma.$queryRaw<
       Array<{
         id: string;
         number: string;
         date: Date;
+        status: string;
+        netsale: number;
+        total: number;
+        settled: number;
         collected: number;
-        taxrealized: number;
         cogs: number;
         expense: number;
         retnet: number;
+        rettotal: number;
         retcogs: number;
       }>
     >(Prisma.sql`
       SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
+             inv.status AS status,
+             (inv.subtotal - inv.discount)::float AS netsale,
+             inv.total::float AS total,
+             inv."amountPaid"::float AS settled,
              COALESCE(pm.paid, 0)::float AS collected,
-             (inv."taxAmount" * COALESCE(pm.paid, 0) / NULLIF(inv.total, 0))::float AS taxrealized,
              COALESCE(c.cost, 0)::float AS cogs,
              COALESCE(e.exp, 0)::float AS expense,
              COALESCE(r.net, 0)::float AS retnet,
+             COALESCE(r.total, 0)::float AS rettotal,
              COALESCE(r.cogs, 0)::float AS retcogs
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
@@ -428,7 +434,7 @@ router.get(
         SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
       ) pm ON true
       LEFT JOIN LATERAL (
-        SELECT SUM("netAmount") AS net, SUM(cogs) AS cogs
+        SELECT SUM("netAmount") AS net, SUM("totalAmount") AS total, SUM(cogs) AS cogs
         FROM "CreditNote" cn WHERE cn."invoiceId" = inv.id
       ) r ON true
       WHERE ${Prisma.join(conditions, " AND ")}
@@ -441,18 +447,20 @@ router.get(
       period: { from: from ?? null, to: to ?? null },
       pnl: {
         salesGross: round2(salesGross),
+        grossSales: round2(grossSales),
         amountCollected: round2(amountCollected),
         outstanding: round2(outstanding),
         returns: round2(returnsTotal),
-        salesNet: round2(adjNetRevenue),
+        returnsNet: round2(returnsNet),
+        salesNet: round2(netSales),
         serviceIncome: round2(serviceIncome),
-        cogs: round2(adjCogs),
-        grossProfit: round2(adjGrossProfit),
-        grossMarginPct: adjNetRevenue ? round2((adjGrossProfit / adjNetRevenue) * 100) : 0,
+        cogs: round2(netCogs),
+        grossProfit: round2(grossProfitAmt),
+        grossMarginPct: netSales ? round2((grossProfitAmt / netSales) * 100) : 0,
         expenses: round2(totalExpenses),
         netProfit: round2(netProfit),
         netMarginPct: totalIncome ? round2((netProfit / totalIncome) * 100) : 0,
-        taxCollected: round2(taxCollected),
+        taxCollected: round2(gstBilled),
         purchases: round2(Number(purchases._sum.total ?? 0)),
         taxPaid: round2(Number(purchases._sum.taxAmount ?? 0)),
         salesCount: sales._count,
@@ -460,17 +468,24 @@ router.get(
       },
       monthly,
       bills: billRows.map((b) => {
-        const rev = round2(Number(b.collected) - Number(b.taxrealized) - Number(b.retnet));
+        const rev = round2(Number(b.netsale) - Number(b.retnet));
         const c = round2(Number(b.cogs) - Number(b.retcogs));
         const exp = round2(Number(b.expense));
+        const due = Math.max(
+          0,
+          Number(b.total) - Number(b.settled) - Number(b.rettotal)
+        );
         return {
           id: b.id,
           number: b.number,
           date: b.date,
+          status: b.status,
           revenue: rev,
           cogs: c,
           expense: exp,
           profit: round2(rev - c - exp),
+          collected: round2(Number(b.collected)),
+          outstanding: round2(due),
         };
       }),
     });
@@ -574,10 +589,11 @@ router.get(
         // Cash collected = customer payments only; amountPaid also folds in the
         // bill-linked charges that settle the due, so it drives outstanding.
         amountCollected: round2(cashCollected),
-        outstanding: round2(total - Number(invoice.amountPaid) - returnTotal),
+        outstanding: round2(Math.max(0, total - Number(invoice.amountPaid) - returnTotal)),
         returns: round2(returnTotal),
         cogs: round2(cogs),
         grossProfit: round2(grossProfit),
+        grossMarginPct: netSale ? round2((grossProfit / netSale) * 100) : 0,
         charges,
         chargesTotal: round2(chargesTotal),
         netProfit: round2(netProfit),

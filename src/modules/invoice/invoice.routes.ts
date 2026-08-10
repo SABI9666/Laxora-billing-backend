@@ -87,12 +87,29 @@ router.get(
           expenseRows.map((r) => [r.invoiceId, Number(r._sum.amount ?? 0)])
         );
 
+        // Sales returns (credit notes) reverse both the revenue and the cost
+        // of the returned goods — same formula as the P&L report, so the
+        // profit shown on the list matches everywhere else.
+        const returnRows = await prisma.creditNote.groupBy({
+          by: ["invoiceId"],
+          where: { businessId: req.businessId!, invoiceId: { in: saleIds } },
+          _sum: { netAmount: true, cogs: true },
+        });
+        const returnMap = new Map(
+          returnRows.map((r) => [
+            r.invoiceId,
+            { net: Number(r._sum.netAmount ?? 0), cogs: Number(r._sum.cogs ?? 0) },
+          ])
+        );
+
         for (const inv of invoices) {
           if (inv.type !== "SALE") continue;
+          const ret = returnMap.get(inv.id) ?? { net: 0, cogs: 0 };
           const profit =
             Number(inv.subtotal) -
             Number(inv.discount) -
-            (cogsMap.get(inv.id) ?? 0) -
+            ret.net -
+            ((cogsMap.get(inv.id) ?? 0) - ret.cogs) -
             (expenseMap.get(inv.id) ?? 0);
           profitMap.set(inv.id, Math.round((profit + Number.EPSILON) * 100) / 100);
         }
