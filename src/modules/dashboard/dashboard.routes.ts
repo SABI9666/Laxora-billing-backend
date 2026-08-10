@@ -93,10 +93,12 @@ router.get(
 
     // Sales + cash-out pieces for a period → profit (net revenue is ex-GST;
     // COGS is de-grossed to ex-GST to match; expenses subtract fully).
-    // Service/other income (credit vouchers, e.g. LED service) is added on top
-    // of sales — it has no COGS, so the full amount is profit.
+    // Sales returns (credit notes) reverse both the revenue and the cost of
+    // the returned goods, so the profit here always agrees with the P&L
+    // report. Service/other income (credit vouchers, e.g. LED service) is
+    // added on top of sales — it has no COGS, so the full amount is profit.
     const profitFor = async (from: Date) => {
-      const [rev, cogsRows, exp, svc] = await Promise.all([
+      const [rev, cogsRows, exp, svc, ret] = await Promise.all([
         prisma.invoice.aggregate({
           where: { businessId, type: "SALE", invoiceDate: { gte: from } },
           _sum: { subtotal: true, discount: true, total: true },
@@ -124,10 +126,16 @@ router.get(
           },
           _sum: { amount: true },
         }),
+        prisma.creditNote.aggregate({
+          where: { businessId, date: { gte: from } },
+          _sum: { netAmount: true, cogs: true },
+        }),
       ]);
+      const returnsNet = Number(ret._sum.netAmount ?? 0);
+      const returnsCogs = Number(ret._sum.cogs ?? 0);
       const netRevenue =
-        Number(rev._sum.subtotal ?? 0) - Number(rev._sum.discount ?? 0);
-      const cogs = Number(cogsRows[0]?.cogs ?? 0);
+        Number(rev._sum.subtotal ?? 0) - Number(rev._sum.discount ?? 0) - returnsNet;
+      const cogs = Number(cogsRows[0]?.cogs ?? 0) - returnsCogs;
       const expenses = Number(exp._sum.amount ?? 0);
       const serviceIncome = Number(svc._sum.amount ?? 0);
       return {
