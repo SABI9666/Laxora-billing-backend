@@ -1743,7 +1743,19 @@ router.get(
   asyncHandler(async (req, res) => {
     const memberships = await prisma.membership.findMany({
       where: { businessId: req.params.id },
-      include: { user: { select: { id: true, name: true, username: true, email: true } } },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            username: true,
+            email: true,
+            // How many shops this login can access — lets the admin UI show
+            // "shared with N other shops" for multi-shop logins.
+            _count: { select: { memberships: true } },
+          },
+        },
+      },
       orderBy: { createdAt: "asc" },
     });
     res.json({
@@ -1753,6 +1765,7 @@ router.get(
         username: m.user.username,
         email: m.user.email,
         role: m.role,
+        shopCount: m.user._count.memberships,
       })),
     });
   })
@@ -1789,6 +1802,64 @@ router.post(
     res.status(201).json({
       login: { userId: user.id, name: user.name, username: user.username },
     });
+  })
+);
+
+// POST /api/admin/businesses/:id/logins/attach — give an EXISTING login access
+// to this shop too. Used when one team runs several shops (e.g. Laxora
+// Peravoor + Laxora Decorative) with a single username: the staff sign in
+// once and switch shops inside the app.
+router.post(
+  "/businesses/:id/logins/attach",
+  validateBody(z.object({ username: z.string().min(1) })),
+  asyncHandler(async (req, res) => {
+    const id = req.params.id;
+    const business = await prisma.business.findUnique({ where: { id } });
+    if (!business) throw notFound("Shop not found");
+
+    const uname = String(req.body.username).trim().toLowerCase();
+    const user = await prisma.user.findFirst({
+      where: {
+        OR: [{ username: uname }, { email: uname }, { email: `${uname}@shop.laxora` }],
+      },
+    });
+    if (!user) throw notFound("No login found with that username");
+
+    const existing = await prisma.membership.findUnique({
+      where: { userId_businessId: { userId: user.id, businessId: id } },
+    });
+    if (existing) throw conflict("That login already has access to this shop");
+
+    await prisma.membership.create({
+      data: { userId: user.id, businessId: id, role: "MANAGER" },
+    });
+    res.status(201).json({
+      login: { userId: user.id, name: user.name, username: user.username },
+    });
+  })
+);
+
+// DELETE /api/admin/businesses/:id/logins/:userId — remove a login's access to
+// THIS shop only. The account itself survives while it still has other shops;
+// when this was its last shop the now-orphaned account is deleted with it.
+router.delete(
+  "/businesses/:id/logins/:userId",
+  asyncHandler(async (req, res) => {
+    const { id, userId } = req.params;
+    const membership = await prisma.membership.findUnique({
+      where: { userId_businessId: { userId, businessId: id } },
+      include: { user: { select: { isPlatformAdmin: true } } },
+    });
+    if (!membership) throw notFound("Login not found on this shop");
+    if (membership.user.isPlatformAdmin)
+      throw badRequest("Cannot remove a platform admin here");
+
+    await prisma.$transaction(async (tx) => {
+      await tx.membership.delete({ where: { id: membership.id } });
+      const remaining = await tx.membership.count({ where: { userId } });
+      if (remaining === 0) await tx.user.delete({ where: { id: userId } });
+    });
+    res.status(204).send();
   })
 );
 
