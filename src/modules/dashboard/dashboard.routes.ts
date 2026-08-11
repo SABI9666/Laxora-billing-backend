@@ -26,7 +26,7 @@ router.get(
         }),
         prisma.invoice.findMany({
           where: { businessId, type: "SALE", status: { in: ["UNPAID", "PARTIAL"] } },
-          select: { total: true, amountPaid: true },
+          select: { id: true, total: true, amountPaid: true },
         }),
         prisma.party.count({ where: { businessId } }),
         prisma.item.count({ where: { businessId } }),
@@ -38,8 +38,23 @@ router.get(
         ),
       ]);
 
+    // Credit notes reduce what a customer still owes on a bill — keeps this
+    // figure in line with the admin cash book's "balance to receive".
+    const summaryCn = await prisma.creditNote.groupBy({
+      by: ["invoiceId"],
+      where: { businessId, invoiceId: { in: receivableInvoices.map((i) => i.id) } },
+      _sum: { totalAmount: true },
+    });
+    const summaryCnMap = new Map(
+      summaryCn.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
+    );
     const totalReceivable = receivableInvoices.reduce(
-      (s, i) => s + (Number(i.total) - Number(i.amountPaid)),
+      (s, i) =>
+        s +
+        Math.max(
+          0,
+          Number(i.total) - Number(i.amountPaid) - (summaryCnMap.get(i.id) ?? 0)
+        ),
       0
     );
 
@@ -170,11 +185,11 @@ router.get(
       }),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", status: { in: ["UNPAID", "PARTIAL"] } },
-        select: { total: true, amountPaid: true },
+        select: { id: true, total: true, amountPaid: true },
       }),
       prisma.invoice.findMany({
         where: { businessId, type: "PURCHASE", status: { in: ["UNPAID", "PARTIAL"] } },
-        select: { total: true, amountPaid: true },
+        select: { id: true, total: true, amountPaid: true },
       }),
       prisma.$queryRaw<Array<{ count: bigint }>>(
         Prisma.sql`SELECT COUNT(*)::bigint AS count FROM "Item"
@@ -284,11 +299,24 @@ router.get(
       };
     });
 
-    const due = (rows: { total: unknown; amountPaid: unknown }[]) =>
+    // Credit notes reduce what a customer still owes on a bill — keeps the
+    // "to receive" card in line with the admin cash book.
+    const pendingCn = await prisma.creditNote.groupBy({
+      by: ["invoiceId"],
+      where: { businessId, invoiceId: { in: receivables.map((i) => i.id) } },
+      _sum: { totalAmount: true },
+    });
+    const pendingCnMap = new Map(
+      pendingCn.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
+    );
+    const due = (
+      rows: { id: string; total: unknown; amountPaid: unknown }[],
+      cn?: Map<string | null, number>
+    ) =>
       rows
-        .map((r) => Number(r.total) - Number(r.amountPaid))
+        .map((r) => Number(r.total) - Number(r.amountPaid) - (cn?.get(r.id) ?? 0))
         .filter((d) => d > 0.009);
-    const recv = due(receivables);
+    const recv = due(receivables, pendingCnMap);
     const pay = due(payables);
 
     res.json({
