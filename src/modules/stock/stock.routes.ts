@@ -95,6 +95,43 @@ router.post(
   })
 );
 
+// GET /api/stock/transfer-targets — where can this shop send stock?
+// - internal: the user's OWN other shops (same team runs both, e.g.
+//   Pradeeksha/Peravoor ↔ Laxora Decorative). Always transferable.
+// - external: other shops in the same franchise that this team does NOT run.
+router.get(
+  "/transfer-targets",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const [current, memberships] = await Promise.all([
+      prisma.business.findUnique({
+        where: { id: businessId },
+        select: { franchiseId: true },
+      }),
+      prisma.membership.findMany({
+        where: { userId: req.auth!.userId },
+        select: { business: { select: { id: true, name: true, code: true } } },
+      }),
+    ]);
+    const internal = memberships
+      .map((m) => m.business)
+      .filter((b) => b.id !== businessId);
+    const excludeIds = [businessId, ...internal.map((b) => b.id)];
+    const external = current?.franchiseId
+      ? await prisma.business.findMany({
+          where: {
+            franchiseId: current.franchiseId,
+            isActive: true,
+            id: { notIn: excludeIds },
+          },
+          select: { id: true, name: true, code: true },
+          orderBy: { name: "asc" },
+        })
+      : [];
+    res.json({ internal, external });
+  })
+);
+
 const transferSchema = z.object({
   itemId: z.string().min(1),
   toBusinessId: z.string().min(1),
@@ -102,9 +139,12 @@ const transferSchema = z.object({
   reason: z.string().optional(),
 });
 
-// POST /api/stock/transfer — move stock to another shop in the same franchise.
+// POST /api/stock/transfer — move stock to another shop.
+// Internal transfer: the destination is another shop the SAME user runs
+// (their login has a membership there) — always allowed, franchise or not.
+// External transfer: any other shop — allowed only within the same franchise.
 // The destination shop must already hold a matching item (same SKU, else same
-// name) so balances stay consistent across shops.
+// name) so balances stay consistent across shops; otherwise it is created.
 router.post(
   "/transfer",
   requireRole(...SHOP_MANAGERS),
@@ -117,19 +157,32 @@ router.post(
       throw badRequest("Source and destination shops must differ");
     }
 
-    const [source, fromShop, toShop] = await Promise.all([
+    const [source, fromShop, toShop, ownMembership] = await Promise.all([
       prisma.item.findFirst({ where: { id: body.itemId, businessId: fromBusinessId } }),
       prisma.business.findUnique({ where: { id: fromBusinessId } }),
       prisma.business.findUnique({ where: { id: body.toBusinessId } }),
+      prisma.membership.findUnique({
+        where: {
+          userId_businessId: {
+            userId: req.auth!.userId,
+            businessId: body.toBusinessId,
+          },
+        },
+      }),
     ]);
 
     if (!source) throw notFound("Item not found in this shop");
     if (source.isService) throw badRequest("Cannot transfer a service item");
     if (!toShop) throw notFound("Destination shop not found");
 
-    // Both shops must belong to the same franchise.
-    if (!fromShop?.franchiseId || fromShop.franchiseId !== toShop.franchiseId) {
-      throw forbidden("Shops must belong to the same franchise to transfer stock");
+    const isInternal = Boolean(ownMembership);
+    if (!isInternal) {
+      // External destinations must be in the same franchise.
+      if (!fromShop?.franchiseId || fromShop.franchiseId !== toShop.franchiseId) {
+        throw forbidden(
+          "External transfers are only allowed to shops in the same franchise"
+        );
+      }
     }
 
     if (Number(source.stockQty) < body.quantity) {
@@ -146,7 +199,8 @@ router.post(
       },
     });
 
-    const transferRef = `TRF-${Date.now()}`;
+    // INT = between the same team's own shops; EXT = to another franchise shop.
+    const transferRef = `TRF-${isInternal ? "INT" : "EXT"}-${Date.now()}`;
 
     const result = await prisma.$transaction(async (tx) => {
       if (!destItem) {
@@ -192,7 +246,7 @@ router.post(
       return { transferRef, fromBalance, toBalance, destItemId: destItem.id };
     });
 
-    res.status(201).json(result);
+    res.status(201).json({ ...result, kind: isInternal ? "internal" : "external" });
   })
 );
 
