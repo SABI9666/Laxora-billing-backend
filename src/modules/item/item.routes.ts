@@ -47,11 +47,13 @@ const itemSchema = z.object({
   name: z.string().min(1),
   categoryId: z.string().optional().nullable(),
   supplierId: z.string().optional().nullable(),
-  sku: z.string().optional(),
-  barcode: z.string().optional(),
-  brand: z.string().optional(),
-  wattage: z.string().optional(),
-  hsn: z.string().optional(),
+  // Nullable as well as optional: a product saved without one of these has
+  // null in the database, and edit forms echo that null back.
+  sku: z.string().optional().nullable(),
+  barcode: z.string().optional().nullable(),
+  brand: z.string().optional().nullable(),
+  wattage: z.string().optional().nullable(),
+  hsn: z.string().optional().nullable(),
   unit: z.string().default("PCS"),
   salePrice: z.number().nonnegative().default(0),
   mrp: z.number().nonnegative().default(0),
