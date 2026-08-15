@@ -2,6 +2,7 @@ import { Router } from "express";
 import multer from "multer";
 import { Storage } from "@google-cloud/storage";
 import { z } from "zod";
+import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
@@ -183,16 +184,57 @@ router.get(
 // GET /api/items/edit-history — every product edit in this shop, newest
 // first: what changed (old → new per field), who edited, when, the reason,
 // and whether the admin has approved it yet. Powers the Edit History page.
+// Filtered and paginated on the server so thousands of edits stay fast:
+//   ?search=<product name> &status=PENDING|APPROVED|REJECTED
+//   &priceOnly=1 (only edits touching sale/purchase/MRP/tax)
+//   &from=YYYY-MM-DD &to=YYYY-MM-DD &page=N (50 per page)
 // (Must be registered before "/:id" so "edit-history" isn't read as an id.)
 router.get(
   "/edit-history",
   asyncHandler(async (req, res) => {
-    const requests = await prisma.itemChangeRequest.findMany({
-      where: { businessId: req.businessId! },
-      orderBy: { createdAt: "desc" },
-      take: 300,
+    const businessId = req.businessId!;
+    const PAGE_SIZE = 50;
+    const page = Math.max(1, Number(req.query.page) || 1);
+    const term = String(req.query.search ?? "").trim();
+    const status = String(req.query.status ?? "").toUpperCase();
+    const priceOnly = String(req.query.priceOnly ?? "") === "1";
+    const from = req.query.from ? new Date(String(req.query.from)) : null;
+    const to = req.query.to ? new Date(`${String(req.query.to)}T23:59:59`) : null;
+
+    const conds = [Prisma.sql`"businessId" = ${businessId}`];
+    if (["PENDING", "APPROVED", "REJECTED"].includes(status)) {
+      conds.push(Prisma.sql`status = ${status}`);
+    }
+    if (term) conds.push(Prisma.sql`"itemName" ILIKE ${"%" + term + "%"}`);
+    // JSONB ?| — true when the edit touched any of the price/tax fields.
+    if (priceOnly) {
+      conds.push(
+        Prisma.sql`changes ?| array['salePrice','purchasePrice','mrp','taxRate']`
+      );
+    }
+    if (from && !isNaN(from.getTime())) conds.push(Prisma.sql`"createdAt" >= ${from}`);
+    if (to && !isNaN(to.getTime())) conds.push(Prisma.sql`"createdAt" <= ${to}`);
+    const where = Prisma.join(conds, " AND ");
+
+    const [rows, countRows] = await Promise.all([
+      prisma.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
+        SELECT id, "itemId", "itemName", changes, previous, reason, status,
+               "requestedByName", "createdAt", "reviewedAt"
+        FROM "ItemChangeRequest"
+        WHERE ${where}
+        ORDER BY "createdAt" DESC
+        LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}
+      `),
+      prisma.$queryRaw<Array<{ n: number }>>(Prisma.sql`
+        SELECT COUNT(*)::int AS n FROM "ItemChangeRequest" WHERE ${where}
+      `),
+    ]);
+    res.json({
+      requests: rows,
+      total: Number(countRows[0]?.n ?? 0),
+      page,
+      pageSize: PAGE_SIZE,
     });
-    res.json({ requests });
   })
 );
 
