@@ -216,11 +216,22 @@ router.get(
     if (to && !isNaN(to.getTime())) conds.push(Prisma.sql`"createdAt" <= ${to}`);
     const where = Prisma.join(conds, " AND ");
 
+    // LAG carries each item's previous edit record alongside the current one.
+    // Edits recorded before history tracking stored the FULL form (every
+    // field), so the same field's value in the previous edit IS the earlier
+    // value — letting old history still show "earlier → updated" and the
+    // difference. New records carry their own precise `previous` snapshot.
     const [rows, countRows] = await Promise.all([
       prisma.$queryRaw<Array<Record<string, unknown>>>(Prisma.sql`
         SELECT id, "itemId", "itemName", changes, previous, reason, status,
-               "requestedByName", "createdAt", "reviewedAt"
-        FROM "ItemChangeRequest"
+               "requestedByName", "createdAt", "reviewedAt", prevchanges
+        FROM (
+          SELECT *, LAG(changes) OVER (
+            PARTITION BY "itemId" ORDER BY "createdAt", id
+          ) AS prevchanges
+          FROM "ItemChangeRequest"
+          WHERE "businessId" = ${businessId}
+        ) t
         WHERE ${where}
         ORDER BY "createdAt" DESC
         LIMIT ${PAGE_SIZE} OFFSET ${(page - 1) * PAGE_SIZE}
@@ -229,8 +240,39 @@ router.get(
         SELECT COUNT(*)::int AS n FROM "ItemChangeRequest" WHERE ${where}
       `),
     ]);
+    const requests = rows.map((r) => {
+      const rec = r as {
+        changes?: Record<string, unknown> | null;
+        previous?: Record<string, unknown> | null;
+        prevchanges?: Record<string, unknown> | null;
+      };
+      if (!rec.previous && rec.prevchanges) {
+        // Legacy rows saved the whole form, so most fields are identical to
+        // the previous edit. Keep only real differences (plus fields whose
+        // earlier value is unknown) so the row reads as a clean diff.
+        const derived: Record<string, unknown> = {};
+        const realChanges: Record<string, unknown> = {};
+        for (const [k, v] of Object.entries(rec.changes ?? {})) {
+          if (k in rec.prevchanges) {
+            const prevVal = rec.prevchanges[k];
+            if (String(prevVal ?? "") !== String(v ?? "")) {
+              derived[k] = prevVal;
+              realChanges[k] = v;
+            }
+          } else {
+            realChanges[k] = v; // earlier value unknown — still a change
+          }
+        }
+        if (Object.keys(realChanges).length > 0) {
+          rec.changes = realChanges;
+          if (Object.keys(derived).length > 0) rec.previous = derived;
+        }
+      }
+      delete rec.prevchanges;
+      return rec;
+    });
     res.json({
-      requests: rows,
+      requests,
       total: Number(countRows[0]?.n ?? 0),
       page,
       pageSize: PAGE_SIZE,
