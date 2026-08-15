@@ -462,7 +462,9 @@ model ItemChangeRequest {
   business        Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   itemId          String
   itemName        String // snapshot of the product name for display
-  changes         Json // proposed new field values
+  changes         Json // proposed new field values (only fields that differ)
+  previous        Json? // the same fields' values BEFORE the edit (old → new)
+  reason          String? // why the change was made, typed by the editor
   status          String    @default("PENDING") // PENDING | APPROVED | REJECTED
   requestedById   String?
   requestedByName String?

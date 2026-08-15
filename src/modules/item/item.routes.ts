@@ -180,6 +180,22 @@ router.get(
   })
 );
 
+// GET /api/items/edit-history — every product edit in this shop, newest
+// first: what changed (old → new per field), who edited, when, the reason,
+// and whether the admin has approved it yet. Powers the Edit History page.
+// (Must be registered before "/:id" so "edit-history" isn't read as an id.)
+router.get(
+  "/edit-history",
+  asyncHandler(async (req, res) => {
+    const requests = await prisma.itemChangeRequest.findMany({
+      where: { businessId: req.businessId! },
+      orderBy: { createdAt: "desc" },
+      take: 300,
+    });
+    res.json({ requests });
+  })
+);
+
 // GET /api/items/:id
 router.get(
   "/:id",
@@ -403,11 +419,13 @@ router.post(
 );
 
 // PUT /api/items/:id — shop edits go to the admin as a pending approval
-// request (platform admins edit directly).
+// request (platform admins edit directly). Every edit records what changed
+// (old → new per field) and the editor's reason, feeding the shop's
+// "Edit History" page.
 router.put(
   "/:id",
   requireRole(...SHOP_MANAGERS),
-  validateBody(itemSchema.partial()),
+  validateBody(itemSchema.partial().extend({ reason: z.string().max(500).optional() })),
   asyncHandler(async (req, res) => {
     const existing = await prisma.item.findFirst({
       where: { id: req.params.id, businessId: req.businessId! },
@@ -415,10 +433,43 @@ router.put(
     if (!existing) throw notFound("Item not found");
     await assertCategory(req.businessId!, req.body.categoryId);
 
+    const { reason, ...proposed } = req.body as Record<string, unknown> & {
+      reason?: string;
+    };
+
+    // Keep only the fields that actually changed, and snapshot their old
+    // values — that's what makes "₹68 → ₹75" possible in the history.
+    const differs = (cur: unknown, next: unknown) => {
+      if (typeof next === "number") return Number(cur ?? 0) !== next;
+      if (typeof next === "boolean") return Boolean(cur) !== next;
+      return String(cur ?? "") !== String(next ?? "");
+    };
+    const snapshot = (cur: unknown, next: unknown) => {
+      if (typeof next === "number") return Number(cur ?? 0);
+      if (typeof next === "boolean") return Boolean(cur);
+      return cur == null ? null : String(cur);
+    };
+    // `any` so the collected values satisfy Prisma's JSON input type.
+    const changes: Record<string, any> = {};
+    const previous: Record<string, any> = {};
+    for (const [k, v] of Object.entries(proposed)) {
+      const cur = (existing as Record<string, unknown>)[k];
+      if (differs(cur, v)) {
+        changes[k] = v;
+        previous[k] = snapshot(cur, v);
+      }
+    }
+
+    // Nothing actually changed — don't log an empty edit.
+    if (Object.keys(changes).length === 0) {
+      return res.json({ item: existing, unchanged: true });
+    }
+
     const user = await prisma.user.findUnique({
       where: { id: req.auth!.userId },
       select: { name: true, username: true, email: true, isPlatformAdmin: true },
     });
+    const editorName = user?.name ?? user?.username ?? user?.email ?? null;
 
     // Count this edit in the dashboard's per-day activity.
     await prisma.activityLog.create({
@@ -436,7 +487,22 @@ router.put(
     if (user?.isPlatformAdmin) {
       const item = await prisma.item.update({
         where: { id: req.params.id },
-        data: req.body,
+        data: changes,
+      });
+      // Log the applied edit so the history is complete for admin edits too.
+      await prisma.itemChangeRequest.create({
+        data: {
+          businessId: req.businessId!,
+          itemId: existing.id,
+          itemName: existing.name,
+          changes,
+          previous,
+          reason: reason || null,
+          status: "APPROVED",
+          reviewedAt: new Date(),
+          requestedById: req.auth!.userId,
+          requestedByName: editorName,
+        },
       });
       return res.json({ item });
     }
@@ -447,9 +513,11 @@ router.put(
         businessId: req.businessId!,
         itemId: existing.id,
         itemName: existing.name,
-        changes: req.body,
+        changes,
+        previous,
+        reason: reason || null,
         requestedById: req.auth!.userId,
-        requestedByName: user?.name ?? user?.username ?? user?.email ?? null,
+        requestedByName: editorName,
       },
     });
     res.status(202).json({
