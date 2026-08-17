@@ -66,19 +66,64 @@ router.post(
       if (!invoice) throw badRequest("Invalid invoiceId for this business");
     }
 
+    // A settling payment with a party but NO specific bill chosen is
+    // auto-allocated to that party's outstanding bills, oldest first — so a
+    // ₹5,000 receipt against an ₹8,000 pending bill leaves ₹3,000 due, and a
+    // full ₹8,000 receipt clears the bill out of the pending list entirely.
+    const settlesSales =
+      body.direction === "IN" && (body.purpose ?? "Customer Receipt") === "Customer Receipt";
+    const settlesPurchases = body.direction === "OUT" && body.purpose === "Supplier Payment";
+    const autoAllocate =
+      !body.invoiceId && !!body.partyId && (settlesSales || settlesPurchases);
+
     const payment = await prisma.$transaction(async (tx) => {
+      const common = {
+        businessId,
+        partyId: body.partyId ?? null,
+        direction: body.direction,
+        purpose: body.purpose ?? null,
+        method: body.method,
+        paymentDate: body.paymentDate ?? new Date(),
+        notes: body.notes ?? null,
+      };
+
+      if (autoAllocate) {
+        const open = await tx.invoice.findMany({
+          where: {
+            businessId,
+            partyId: body.partyId!,
+            type: settlesSales ? "SALE" : "PURCHASE",
+            status: { in: ["UNPAID", "PARTIAL"] },
+          },
+          orderBy: { invoiceDate: "asc" },
+        });
+        let remaining = body.amount;
+        let first = null;
+        for (const inv of open) {
+          if (remaining <= 0.009) break;
+          const due = Number(inv.total) - Number(inv.amountPaid);
+          if (due <= 0.009) continue;
+          const part = Math.round(Math.min(remaining, due) * 100) / 100;
+          const created = await tx.payment.create({
+            data: { ...common, invoiceId: inv.id, amount: part },
+          });
+          first = first ?? created;
+          await recomputeInvoiceSettlement(tx, inv.id);
+          remaining = Math.round((remaining - part) * 100) / 100;
+        }
+        // Anything left over (advance / no open bills) stays as an unlinked
+        // receipt on the party's ledger.
+        if (remaining > 0.009 || !first) {
+          const created = await tx.payment.create({
+            data: { ...common, invoiceId: null, amount: remaining > 0.009 ? remaining : body.amount },
+          });
+          first = first ?? created;
+        }
+        return first;
+      }
+
       const created = await tx.payment.create({
-        data: {
-          businessId,
-          partyId: body.partyId ?? null,
-          invoiceId: body.invoiceId ?? null,
-          direction: body.direction,
-          purpose: body.purpose ?? null,
-          amount: body.amount,
-          method: body.method,
-          paymentDate: body.paymentDate ?? new Date(),
-          notes: body.notes ?? null,
-        },
+        data: { ...common, invoiceId: body.invoiceId ?? null, amount: body.amount },
       });
 
       // If linked to an invoice, recompute amountPaid and status (payments
