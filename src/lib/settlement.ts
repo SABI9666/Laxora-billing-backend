@@ -38,7 +38,11 @@ export async function recomputeInvoiceSettlement(db: Db, invoiceId: string) {
   const charges = Number(expAgg._sum.amount ?? 0);
   const total = Number(invoice.total);
   // Cap at total so charges never over-settle the bill.
-  const paid = round2(Math.min(payments + charges, total));
+  let paid = round2(Math.min(payments + charges, total));
+  // Paise-level rounding leftovers (≤ ₹0.05) are written off: a customer who
+  // has effectively cleared the bill must not linger in the pending list
+  // showing ₹0.02 due.
+  if (paid > 0 && total - paid > 0 && total - paid <= 0.05) paid = total;
   const status = paid <= 0 ? "UNPAID" : paid >= total ? "PAID" : "PARTIAL";
   await db.invoice.update({
     where: { id: invoiceId },
