@@ -266,6 +266,9 @@ model Invoice {
   // External reference for online orders (website order id) — used to make
   // order syncing idempotent so the same order never bills twice.
   externalRef   String?
+  // The estimate/quotation number this bill was raised from (free text, shown
+  // on the printed invoice).
+  estimateNo    String?
   // Uploaded bill documents (e.g. the supplier's purchase bill), image or PDF.
   // Up to three can be attached.
   attachmentUrl  String?
