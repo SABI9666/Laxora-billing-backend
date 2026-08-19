@@ -26,6 +26,8 @@ const invoiceSchema = z.object({
   dueDate: z.coerce.date().optional(),
   discount: z.number().nonnegative().default(0),
   notes: z.string().optional(),
+  // Estimate/quotation number this bill was raised from (free text).
+  estimateNo: z.string().max(40).optional().nullable(),
   // Uploaded bill document (supplier purchase bill), image or PDF URL.
   attachmentUrl: z.string().optional().nullable(),
   attachmentUrl2: z.string().optional().nullable(),
@@ -200,6 +202,7 @@ router.post(
           taxAmount,
           total,
           notes: body.notes ?? null,
+          estimateNo: body.estimateNo?.trim() || null,
           attachmentUrl: body.attachmentUrl ?? null,
           attachmentUrl2: body.attachmentUrl2 ?? null,
           attachmentUrl3: body.attachmentUrl3 ?? null,
@@ -334,6 +337,7 @@ router.put(
           total,
           status,
           notes: body.notes ?? null,
+          estimateNo: body.estimateNo?.trim() || null,
           attachmentUrl: body.attachmentUrl ?? null,
           attachmentUrl2: body.attachmentUrl2 ?? null,
           attachmentUrl3: body.attachmentUrl3 ?? null,
