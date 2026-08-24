@@ -63,6 +63,21 @@ router.get(
     // discount) minus ex-GST cost of goods (purchase price is GST-inclusive).
     const saleIds = invoices.filter((i) => i.type === "SALE").map((i) => i.id);
     const profitMap = new Map<string, number>();
+
+    // Value returned against each bill. `amountPaid` only counts money the
+    // customer actually paid, so a return (or the return half of an exchange)
+    // has to be subtracted separately to get the real pending amount — the
+    // same way the dashboard and the admin cash book already do it.
+    const returnedMap = new Map<string, number>();
+    if (saleIds.length) {
+      const cnRows = await prisma.creditNote.groupBy({
+        by: ["invoiceId"],
+        where: { businessId: req.businessId!, invoiceId: { in: saleIds } },
+        _sum: { totalAmount: true },
+      });
+      for (const r of cnRows)
+        if (r.invoiceId) returnedMap.set(r.invoiceId, Number(r._sum.totalAmount ?? 0));
+    }
     // Profit is a nice-to-have: never let a problem computing it (bad data,
     // a divide-by-zero tax rate, etc.) crash the whole invoice list.
     if (saleIds.length) {
@@ -122,7 +137,11 @@ router.get(
     }
 
     res.json({
-      invoices: invoices.map((inv) => ({ ...inv, profit: profitMap.get(inv.id) ?? null })),
+      invoices: invoices.map((inv) => ({
+        ...inv,
+        profit: profitMap.get(inv.id) ?? null,
+        returnedAmount: round2(returnedMap.get(inv.id) ?? 0),
+      })),
     });
   })
 );
@@ -141,7 +160,17 @@ router.get(
       },
     });
     if (!invoice) throw notFound("Invoice not found");
-    res.json({ invoice });
+
+    // Value already returned against this bill (see the list endpoint) so the
+    // caller can show the true pending amount.
+    const cn = await prisma.creditNote.aggregate({
+      where: { businessId: req.businessId!, invoiceId: invoice.id },
+      _sum: { totalAmount: true },
+    });
+
+    res.json({
+      invoice: { ...invoice, returnedAmount: round2(Number(cn._sum.totalAmount ?? 0)) },
+    });
   })
 );
 
@@ -538,14 +567,47 @@ router.delete(
 // puts the returned items back into stock, records a credit note (which shows
 // in the customer ledger as a credit and reduces P&L revenue/COGS). The
 // original bill is kept intact for history.
+//
+// The same call also handles an EXCHANGE (the customer hands goods back and
+// takes other products instead). Everything then happens in ONE database
+// transaction so stock and the cash book can never drift apart:
+//   1. returned goods go back into stock + a credit note is raised,
+//   2. the replacement goods are appended to the same bill and taken out of
+//      stock,
+//   3. the difference is settled — collected as a receipt (cash book up),
+//      refunded as an OUT voucher (cash book down), or left on the ledger.
+// Previously the UI fired three separate requests for this, so a failure part
+// way through left stock back in but no replacement billed, and any refund
+// was an unlinked voucher that undoing the return could not give back.
+const exchangeSchema = z.object({
+  // When true, the entered rates are GST-inclusive and the tax is split out.
+  taxInclusive: z.boolean().default(false),
+  items: z.array(lineSchema).min(1),
+  // Customer owes more (new goods cost more than what came back):
+  //   FULL = collect all of it now, PARTIAL = collect `collectAmount`,
+  //   NONE = leave it pending on the bill.
+  collect: z.enum(["FULL", "PARTIAL", "NONE"]).default("FULL"),
+  collectAmount: z.number().nonnegative().optional(),
+  collectMethod: z
+    .enum(["CASH", "BANK", "UPI", "CARD", "CHEQUE", "OTHER"])
+    .default("CASH"),
+  // Customer is owed money back (new goods cost less):
+  //   ADJUST = keep it as a credit on their ledger (no cash moves),
+  //   CASH/BANK = hand it back now, which lowers that balance in the cash book.
+  refund: z.enum(["ADJUST", "CASH", "BANK"]).default("ADJUST"),
+});
+
 const returnSchema = z.object({
   reason: z.string().optional(),
   // When the customer is physically given money back, choose CASH or BANK so the
   // cash book drops by the refund. Leave empty to only credit the ledger.
+  // Ignored in exchange mode — there the difference (not the whole return
+  // value) is what moves, and `exchange.refund` decides how.
   refundMethod: z.enum(["CASH", "BANK"]).optional(),
   items: z
     .array(z.object({ invoiceItemId: z.string().min(1), quantity: z.number().positive() }))
     .min(1),
+  exchange: exchangeSchema.optional(),
 });
 
 router.post(
@@ -623,6 +685,47 @@ router.post(
       taxRate: r.taxRate,
     }));
 
+    // ---- Exchange: the replacement goods the customer walks out with. -------
+    // Same ex-GST normalisation as invoice creation / add-items, so the bill's
+    // subtotal, GST and total stay internally consistent.
+    const exch = body.exchange;
+    const exchLines = (exch?.items ?? []).map((l) => {
+      const netRate = round2(l.rate / (exch?.taxInclusive ? 1 + l.taxRate / 100 : 1));
+      return { ...l, rate: netRate, amount: round2(l.quantity * netRate) };
+    });
+    const exchSubtotal = round2(exchLines.reduce((s, l) => s + l.amount, 0));
+    const exchTax = round2(exchLines.reduce((s, l) => s + (l.amount * l.taxRate) / 100, 0));
+    const exchGross = round2(exchSubtotal + exchTax);
+    // Positive → the customer owes the shop more; negative → the shop owes the
+    // customer. Both are settled inside the transaction below.
+    const difference = round2(exchGross - returnGross);
+
+    // Never move stock on a product from another shop.
+    if (exch) {
+      const exchItemIds = [...new Set(exchLines.map((l) => l.itemId).filter(Boolean))] as string[];
+      if (exchItemIds.length) {
+        const owned = await prisma.item.count({
+          where: { id: { in: exchItemIds }, businessId },
+        });
+        if (owned !== exchItemIds.length)
+          throw badRequest("One of the exchange products does not belong to this shop.");
+      }
+    }
+
+    // What actually moves through the cash book for this exchange.
+    let collected = 0;
+    let refunded = 0;
+    if (exch) {
+      if (difference > 0.009 && exch.collect !== "NONE") {
+        collected =
+          exch.collect === "FULL"
+            ? difference
+            : round2(Math.min(Math.max(exch.collectAmount ?? 0, 0), difference));
+      } else if (difference < -0.009 && exch.refund !== "ADJUST") {
+        refunded = round2(-difference);
+      }
+    }
+
     const creditNote = await prisma.$transaction(async (tx) => {
       for (const r of returned) {
         // Record how much of this line is now returned (prevents re-returning).
@@ -643,9 +746,102 @@ router.post(
         });
       }
 
-      // Optional cash/bank refund: an OUT voucher that lowers the cash book.
+      // Exchange: append the replacement goods to the SAME bill and take them
+      // out of stock, exactly like /add-items does — subtotal, GST and total
+      // all grow, so the printed bill, GST report and P&L pick the swap up.
+      // The created lines are remembered on the credit note so undoing the
+      // return can strip them off again.
+      const exchangeRecord: Array<{
+        invoiceItemId: string;
+        itemId: string | null;
+        quantity: number;
+        rate: number;
+        taxRate: number;
+        amount: number;
+      }> = [];
+      if (exch && exchLines.length) {
+        await tx.invoice.update({
+          where: { id: invoice.id },
+          data: {
+            subtotal: round2(Number(invoice.subtotal) + exchSubtotal),
+            taxAmount: round2(Number(invoice.taxAmount) + exchTax),
+            total: round2(
+              Number(invoice.subtotal) +
+                exchSubtotal -
+                Number(invoice.discount) +
+                Number(invoice.taxAmount) +
+                exchTax
+            ),
+          },
+        });
+        for (const l of exchLines) {
+          const created = await tx.invoiceItem.create({
+            data: {
+              invoiceId: invoice.id,
+              itemId: l.itemId ?? null,
+              description: l.description,
+              quantity: l.quantity,
+              rate: l.rate,
+              taxRate: l.taxRate,
+              amount: l.amount,
+            },
+          });
+          exchangeRecord.push({
+            invoiceItemId: created.id,
+            itemId: l.itemId ?? null,
+            quantity: l.quantity,
+            rate: l.rate,
+            taxRate: l.taxRate,
+            amount: l.amount,
+          });
+          if (!l.itemId) continue;
+          await recordStockMovement(tx, {
+            businessId,
+            itemId: l.itemId,
+            type: StockMovementType.OUT,
+            quantity: -l.quantity,
+            reason: `Exchange${body.reason ? ` - ${body.reason}` : ""}`,
+            reference: invoice.invoiceNumber,
+            invoiceId: invoice.id,
+            createdById: req.auth!.userId,
+          });
+        }
+      }
+
+      // Money the customer hands over for a costlier replacement: a normal
+      // receipt against this bill, so the cash book goes up and the bill's
+      // pending amount comes down.
+      let collectPaymentId: string | null = null;
+      if (collected > 0.009) {
+        const receipt = await tx.payment.create({
+          data: {
+            businessId,
+            partyId: invoice.partyId,
+            invoiceId: invoice.id,
+            direction: PaymentDirection.IN,
+            purpose: "Customer Receipt",
+            amount: collected,
+            method: PaymentMethod[exch!.collectMethod],
+            notes: `Exchange difference on ${invoice.invoiceNumber}`,
+          },
+        });
+        collectPaymentId = receipt.id;
+      }
+
+      // Cash/bank refund: an OUT voucher that lowers the cash book. On a plain
+      // return that is the whole return value; on an exchange it is only the
+      // difference the customer is owed back. Either way it is linked to the
+      // credit note (refundPaymentId), so undoing the return deletes the
+      // voucher and puts the money back in the cash book.
+      const refundMethod = exch
+        ? exch.refund === "ADJUST"
+          ? null
+          : exch.refund
+        : body.refundMethod ?? null;
+      const refundAmount = exch ? refunded : refundMethod ? returnGross : 0;
+
       let refundPaymentId: string | null = null;
-      if (body.refundMethod) {
+      if (refundMethod && refundAmount > 0.009) {
         const refund = await tx.payment.create({
           data: {
             businessId,
@@ -653,18 +849,17 @@ router.post(
             invoiceId: invoice.id,
             direction: PaymentDirection.OUT,
             purpose: "Sales Return Refund",
-            amount: returnGross,
-            method:
-              body.refundMethod === "BANK" ? PaymentMethod.BANK : PaymentMethod.CASH,
-            notes: `Refund for return on ${invoice.invoiceNumber}${
-              body.reason ? ` - ${body.reason}` : ""
-            }`,
+            amount: refundAmount,
+            method: refundMethod === "BANK" ? PaymentMethod.BANK : PaymentMethod.CASH,
+            notes: `${exch ? "Exchange refund" : "Refund"} for return on ${
+              invoice.invoiceNumber
+            }${body.reason ? ` - ${body.reason}` : ""}`,
           },
         });
         refundPaymentId = refund.id;
       }
 
-      return tx.creditNote.create({
+      const note = await tx.creditNote.create({
         data: {
           businessId,
           partyId: invoice.partyId,
@@ -676,14 +871,35 @@ router.post(
           cogs: round2(returnCogs),
           reason: body.reason ?? null,
           lines,
-          refundMethod: body.refundMethod ?? null,
+          refundMethod: refundPaymentId ? refundMethod : null,
           refundPaymentId,
+          exchangeLines: exchangeRecord.length ? exchangeRecord : undefined,
+          collectPaymentId,
           createdById: req.auth!.userId,
         },
       });
+
+      // The bill's total and/or its receipts changed — re-derive amountPaid
+      // and PAID/PARTIAL/UNPAID from scratch so the pending lists, dashboard
+      // and admin reports all agree.
+      await recomputeInvoiceSettlement(tx, invoice.id);
+      return note;
     });
 
-    res.json({ creditNote, returnedAmount: returnGross });
+    res.json({
+      creditNote,
+      returnedAmount: returnGross,
+      ...(exch
+        ? {
+            exchange: {
+              addedAmount: exchGross,
+              difference,
+              collected: round2(collected),
+              refunded: round2(refunded),
+            },
+          }
+        : {}),
+    });
   })
 );
 
