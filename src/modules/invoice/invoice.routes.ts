@@ -7,6 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
+import { recomputeInvoiceSettlement } from "../../lib/settlement";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 
 const router = Router();
@@ -245,6 +246,93 @@ router.post(
       }
 
       return created;
+    });
+
+    res.status(201).json({ invoice });
+  })
+);
+
+const addItemsSchema = z.object({
+  items: z.array(lineSchema).min(1),
+  // When true, entered rates are GST-inclusive and the tax is split out.
+  taxInclusive: z.boolean().default(false),
+});
+
+// POST /api/invoices/:id/add-items — append newly purchased items to an
+// EXISTING bill (e.g. the customer comes back after a few days and takes more
+// goods on the same account). The new lines are added on top of the current
+// ones; subtotal/GST/total grow accordingly, stock is deducted (or added for
+// purchase bills) with an audit movement, and the bill's paid/pending status
+// is recomputed — so the dashboard, pending lists, P&L and admin reports all
+// pick the addition up automatically.
+router.post(
+  "/:id/add-items",
+  requireRole(...BILLING_ROLES),
+  validateBody(addItemsSchema),
+  asyncHandler(async (req, res) => {
+    const body = req.body as z.infer<typeof addItemsSchema>;
+    const businessId = req.businessId!;
+
+    const existing = await prisma.invoice.findFirst({
+      where: { id: req.params.id, businessId },
+    });
+    if (!existing) throw notFound("Bill not found");
+
+    // Same ex-GST normalisation as invoice creation.
+    const lines = body.items.map((l) => {
+      const netRate = round2(l.rate / (body.taxInclusive ? 1 + l.taxRate / 100 : 1));
+      const amount = round2(l.quantity * netRate);
+      return { ...l, rate: netRate, amount };
+    });
+    const addSubtotal = round2(lines.reduce((s, l) => s + l.amount, 0));
+    const addTax = round2(lines.reduce((s, l) => s + (l.amount * l.taxRate) / 100, 0));
+
+    const subtotal = round2(Number(existing.subtotal) + addSubtotal);
+    const taxAmount = round2(Number(existing.taxAmount) + addTax);
+    const total = round2(subtotal - Number(existing.discount) + taxAmount);
+
+    const invoice = await prisma.$transaction(async (tx) => {
+      const updated = await tx.invoice.update({
+        where: { id: existing.id },
+        data: {
+          subtotal,
+          taxAmount,
+          total,
+          items: {
+            create: lines.map((l) => ({
+              itemId: l.itemId ?? null,
+              description: l.description,
+              quantity: l.quantity,
+              rate: l.rate,
+              taxRate: l.taxRate,
+              amount: l.amount,
+            })),
+          },
+        },
+        include: { items: true, party: true },
+      });
+
+      // Stock: a sale addition takes goods out, a purchase addition brings
+      // goods in — each with its own audit trail entry on the same bill.
+      const isSale = existing.type === "SALE";
+      for (const l of lines) {
+        if (!l.itemId) continue;
+        await recordStockMovement(tx, {
+          businessId,
+          itemId: l.itemId,
+          type: isSale ? StockMovementType.OUT : StockMovementType.IN,
+          quantity: isSale ? -l.quantity : l.quantity,
+          reason: isSale ? "Added to bill" : "Added to purchase",
+          reference: existing.invoiceNumber,
+          invoiceId: existing.id,
+          createdById: req.auth!.userId,
+        });
+      }
+
+      // The bill grew, so what's paid may no longer cover it — recompute
+      // amountPaid/status (PAID → PARTIAL when new dues appear).
+      await recomputeInvoiceSettlement(tx, existing.id);
+      return updated;
     });
 
     res.status(201).json({ invoice });
