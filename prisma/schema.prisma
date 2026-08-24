@@ -443,8 +443,18 @@ model CreditNote {
   lines         Json?
   // If the customer was refunded in cash/bank (not just credited on the ledger),
   // this is CASH/BANK and refundPaymentId links the OUT voucher in the cash book.
+  // On an exchange the refund is only the DIFFERENCE the customer is owed back,
+  // not the whole return value.
   refundMethod  String?
   refundPaymentId String?
+  // EXCHANGE (customer handed goods back and took other products instead):
+  // the replacement lines appended to the same bill
+  // ([{invoiceItemId,itemId,quantity,rate,taxRate,amount}]) so undoing the
+  // return can strip them off the bill and put their stock back.
+  exchangeLines Json?
+  // Receipt raised for the extra amount the customer paid on an exchange —
+  // deleted alongside the return so the cash book unwinds too.
+  collectPaymentId String?
   createdById   String?
   createdAt     DateTime @default(now())
 

@@ -240,8 +240,11 @@ router.get(
     // Payment table. A bill-linked charge settles the bill's due (it is inside
     // amountPaid) but is NOT customer cash — it is booked as an expense further
     // down. This feeds the Collections section, not profit.
+    // Refund vouchers on a return/exchange are OUT movements against a sale
+    // bill — they are money going back to the customer, so they are netted off
+    // rather than added to what was collected.
     const collectedRows = await prisma.$queryRaw<Array<{ collected: number }>>(Prisma.sql`
-      SELECT COALESCE(SUM(p.amount), 0)::float AS collected
+      SELECT COALESCE(SUM(CASE WHEN p.direction::text = 'IN' THEN p.amount ELSE -p.amount END), 0)::float AS collected
       FROM "Payment" p
       JOIN "Invoice" inv ON inv.id = p."invoiceId"
       WHERE ${Prisma.join(conditions, " AND ")}
@@ -431,7 +434,13 @@ router.get(
         SELECT SUM(amount) AS exp FROM "Expense" ex WHERE ex."invoiceId" = inv.id
       ) e ON true
       LEFT JOIN LATERAL (
-        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p WHERE p."invoiceId" = inv.id
+        -- Only money that flows the settling way counts as collected: a sale is
+        -- settled by receipts (IN), a purchase by payments (OUT). The opposite
+        -- direction on the same bill is a refund on a return/exchange — it must
+        -- not be added to what the customer paid.
+        SELECT COALESCE(SUM(amount), 0) AS paid FROM "Payment" p
+        WHERE p."invoiceId" = inv.id
+          AND p.direction::text = CASE WHEN inv.type::text = 'PURCHASE' THEN 'OUT' ELSE 'IN' END
       ) pm ON true
       LEFT JOIN LATERAL (
         SELECT SUM("netAmount") AS net, SUM("totalAmount") AS total, SUM(cogs) AS cogs
@@ -543,12 +552,18 @@ router.get(
         _sum: { netAmount: true, totalAmount: true, cogs: true },
       }),
       // Real customer cash for this bill (payments only, not settling charges).
-      prisma.payment.aggregate({
+      // Grouped by direction so a refund voucher on a return/exchange is netted
+      // off instead of counting as more money collected.
+      prisma.payment.groupBy({
+        by: ["direction"],
         where: { invoiceId: invoice.id },
         _sum: { amount: true },
       }),
     ]);
-    const cashCollected = Number(payAgg._sum.amount ?? 0);
+    const settleDir = invoice.type === "PURCHASE" ? "OUT" : "IN";
+    const cashCollected =
+      Number(payAgg.find((g) => g.direction === settleDir)?._sum.amount ?? 0) -
+      Number(payAgg.find((g) => g.direction !== settleDir)?._sum.amount ?? 0);
 
     const grossCogs = Number(cogsRows[0]?.cogs ?? 0);
     const charges = chargeGroups.map((g) => ({

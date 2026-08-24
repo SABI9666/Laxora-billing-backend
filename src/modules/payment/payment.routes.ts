@@ -97,11 +97,26 @@ router.post(
           },
           orderBy: { invoiceDate: "asc" },
         });
+        // Goods returned against a bill already cut what the customer owes on
+        // it, so they must come off the due before a receipt is allocated —
+        // otherwise money lands on a bill that is really settled and the
+        // customer's next genuinely-pending bill stays open.
+        const cnRows = open.length
+          ? await tx.creditNote.groupBy({
+              by: ["invoiceId"],
+              where: { businessId, invoiceId: { in: open.map((i) => i.id) } },
+              _sum: { totalAmount: true },
+            })
+          : [];
+        const returnedMap = new Map(
+          cnRows.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
+        );
         let remaining = body.amount;
         let first = null;
         for (const inv of open) {
           if (remaining <= 0.009) break;
-          const due = Number(inv.total) - Number(inv.amountPaid);
+          const due =
+            Number(inv.total) - Number(inv.amountPaid) - (returnedMap.get(inv.id) ?? 0);
           if (due <= 0.009) continue;
           const part = Math.round(Math.min(remaining, due) * 100) / 100;
           const created = await tx.payment.create({
