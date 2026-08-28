@@ -66,7 +66,11 @@ router.get(
       include: {
         owner: { select: { id: true, name: true, email: true } },
         franchise: { select: { id: true, name: true } },
-        _count: { select: { invoices: true, parties: true, items: true } },
+        // memberships = the logins that can actually open this shop. Zero means
+        // the shop is unreachable: it will not appear in anyone's shop switcher.
+        _count: {
+          select: { invoices: true, parties: true, items: true, memberships: true },
+        },
       },
       orderBy: { createdAt: "desc" },
     });
@@ -75,6 +79,12 @@ router.get(
 );
 
 // POST /api/admin/businesses — create a new shop (owned by the platform admin).
+// The creating admin also gets a membership on it. Access to a shop is granted
+// by Membership alone — resolveTenant, the shop switcher and the select-shop
+// screen all read that table — so a shop created without one is orphaned: it
+// shows in the admin panel but no one can open or select it anywhere, and its
+// "Shop Logins" list comes back empty. Mirrors POST /api/franchise/:id/shops,
+// which already creates the owner's membership.
 router.post(
   "/businesses",
   validateBody(
@@ -87,8 +97,14 @@ router.post(
     })
   ),
   asyncHandler(async (req, res) => {
-    const business = await prisma.business.create({
-      data: { ...req.body, ownerId: req.auth!.userId },
+    const business = await prisma.$transaction(async (tx) => {
+      const created = await tx.business.create({
+        data: { ...req.body, ownerId: req.auth!.userId },
+      });
+      await tx.membership.create({
+        data: { userId: req.auth!.userId, businessId: created.id, role: "OWNER" },
+      });
+      return created;
     });
     res.status(201).json({ business });
   })
