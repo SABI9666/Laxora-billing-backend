@@ -92,18 +92,43 @@ router.get(
     );
     // Reporting period for the stat cards: month (default), quarter (Apr–Jun,
     // Jul–Sep, Oct–Dec, Jan–Mar) or year (financial year, Apr–Mar).
+    //
+    // Monthly mode accepts ?month=YYYY-MM so the picker can look back at an
+    // earlier month. Every period also carries an explicit END, and the one
+    // before it for the "vs last period" comparison. Without that end bound a
+    // past month meant "everything from the 1st onwards", so picking July
+    // returned exactly the same figures as August.
     const period = String(req.query.period || "month");
     const y = ist.getUTCFullYear();
     const m = ist.getUTCMonth();
+    // IST midnight on the 1st of a month, as a UTC instant. Month numbers
+    // outside 0–11 roll into the neighbouring year, which is what we want.
+    const monthStart = (yy: number, mm: number) => new Date(Date.UTC(yy, mm, 1) - IST_MS);
+
     let periodStart: Date;
+    let periodEnd: Date; // exclusive
+    let prevStart: Date;
     if (period === "quarter") {
-      periodStart = new Date(Date.UTC(y, Math.floor(m / 3) * 3, 1) - IST_MS);
+      const q = Math.floor(m / 3) * 3;
+      periodStart = monthStart(y, q);
+      periodEnd = monthStart(y, q + 3);
+      prevStart = monthStart(y, q - 3);
     } else if (period === "year") {
       // Indian financial year: starts 1 April.
-      periodStart = new Date(Date.UTC(m >= 3 ? y : y - 1, 3, 1) - IST_MS);
+      const fy = m >= 3 ? y : y - 1;
+      periodStart = monthStart(fy, 3);
+      periodEnd = monthStart(fy + 1, 3);
+      prevStart = monthStart(fy - 1, 3);
     } else {
-      periodStart = new Date(Date.UTC(y, m, 1) - IST_MS);
+      const asked = String(req.query.month ?? "");
+      const picked = /^\d{4}-(0[1-9]|1[0-2])$/.test(asked) ? asked : null;
+      const py = picked ? Number(picked.slice(0, 4)) : y;
+      const pm = picked ? Number(picked.slice(5, 7)) - 1 : m;
+      periodStart = monthStart(py, pm);
+      periodEnd = monthStart(py, pm + 1);
+      prevStart = monthStart(py, pm - 1);
     }
+    const prevEnd = periodStart;
     const weekStart = new Date(todayStart.getTime() - 6 * 24 * 3600 * 1000);
 
     // Sales + cash-out pieces for a period → profit (net revenue is ex-GST;
@@ -112,10 +137,12 @@ router.get(
     // the returned goods, so the profit here always agrees with the P&L
     // report. Service/other income (credit vouchers, e.g. LED service) is
     // added on top of sales — it has no COGS, so the full amount is profit.
-    const profitFor = async (from: Date) => {
+    const profitFor = async (from: Date, to: Date) => {
+      // `to` is exclusive, so a period covers exactly itself.
+      const range = { gte: from, lt: to };
       const [rev, cogsRows, exp, svc, ret] = await Promise.all([
         prisma.invoice.aggregate({
-          where: { businessId, type: "SALE", invoiceDate: { gte: from } },
+          where: { businessId, type: "SALE", invoiceDate: range },
           _sum: { subtotal: true, discount: true, total: true },
           _count: true,
         }),
@@ -127,9 +154,10 @@ router.get(
           WHERE inv."businessId" = ${businessId}
             AND inv.type = 'SALE'
             AND inv."invoiceDate" >= ${from}
+            AND inv."invoiceDate" < ${to}
         `),
         prisma.expense.aggregate({
-          where: { businessId, date: { gte: from } },
+          where: { businessId, date: range },
           _sum: { amount: true },
         }),
         prisma.payment.aggregate({
@@ -137,12 +165,12 @@ router.get(
             businessId,
             direction: "IN",
             purpose: { in: INCOME_PURPOSE_LIST },
-            paymentDate: { gte: from },
+            paymentDate: range,
           },
           _sum: { amount: true },
         }),
         prisma.creditNote.aggregate({
-          where: { businessId, date: { gte: from } },
+          where: { businessId, date: range },
           _sum: { netAmount: true, cogs: true },
         }),
       ]);
@@ -164,9 +192,12 @@ router.get(
       };
     };
 
+    const todayEnd = new Date(todayStart.getTime() + 24 * 3600 * 1000);
+
     const [
       today,
       month,
+      prev,
       weekSales,
       receivables,
       payables,
@@ -177,8 +208,11 @@ router.get(
       weekPayments,
       weekExpenses,
     ] = await Promise.all([
-      profitFor(todayStart),
-      profitFor(periodStart),
+      profitFor(todayStart, todayEnd),
+      profitFor(periodStart, periodEnd),
+      // The period before the selected one, for the "vs last month/quarter/FY"
+      // line on the Sales and Profit cards.
+      profitFor(prevStart, prevEnd),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", invoiceDate: { gte: weekStart } },
         select: { invoiceDate: true, total: true, channel: true },
@@ -324,8 +358,10 @@ router.get(
         today,
         // Selected period's figures (kept under `month` for compatibility).
         month,
+        prev,
         period,
         periodStart,
+        periodEnd,
         pending: {
           toReceive: round2(recv.reduce((s, d) => s + d, 0)),
           receivableBills: recv.length,
