@@ -94,9 +94,19 @@ router.post(
       gstin: z.string().optional(),
       phone: z.string().optional(),
       address: z.string().optional(),
+      // Attach the new shop to a franchise so it immediately shows up as an
+      // external transfer target for the franchise's other shops.
+      franchiseId: z.string().optional(),
     })
   ),
   asyncHandler(async (req, res) => {
+    const { franchiseId } = req.body as { franchiseId?: string };
+    if (franchiseId) {
+      const franchise = await prisma.franchise.findUnique({
+        where: { id: franchiseId },
+      });
+      if (!franchise) throw notFound("Franchise not found");
+    }
     const business = await prisma.$transaction(async (tx) => {
       const created = await tx.business.create({
         data: { ...req.body, ownerId: req.auth!.userId },
@@ -107,6 +117,35 @@ router.post(
       return created;
     });
     res.status(201).json({ business });
+  })
+);
+
+// PATCH /api/admin/businesses/:id/franchise — attach an existing shop to a
+// franchise (or detach with franchiseId: null). External stock transfers are
+// only offered between shops of the SAME franchise, so a shop created without
+// a franchise never appears in the other shops' "Destination shop" list until
+// it is attached here.
+router.patch(
+  "/businesses/:id/franchise",
+  validateBody(z.object({ franchiseId: z.string().min(1).nullable() })),
+  asyncHandler(async (req, res) => {
+    const { franchiseId } = req.body as { franchiseId: string | null };
+    const business = await prisma.business.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!business) throw notFound("Shop not found");
+    if (franchiseId) {
+      const franchise = await prisma.franchise.findUnique({
+        where: { id: franchiseId },
+      });
+      if (!franchise) throw notFound("Franchise not found");
+    }
+    const updated = await prisma.business.update({
+      where: { id: business.id },
+      data: { franchiseId },
+      include: { franchise: { select: { id: true, name: true } } },
+    });
+    res.json({ business: updated });
   })
 );
 
