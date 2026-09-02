@@ -280,6 +280,10 @@ model Invoice {
   discount      Decimal       @default(0) @db.Decimal(14, 2)
   taxAmount     Decimal       @default(0) @db.Decimal(14, 2)
   total         Decimal       @default(0) @db.Decimal(14, 2)
+  // Whether the line rates were entered GST-inclusive. Rates are always
+  // stored ex-GST; this remembers the entry mode so editing the bill (and
+  // adding more products to it) reopens in the same mode.
+  taxInclusive  Boolean       @default(false)
   amountPaid    Decimal       @default(0) @db.Decimal(14, 2)
   notes         String?
   createdAt     DateTime      @default(now())
