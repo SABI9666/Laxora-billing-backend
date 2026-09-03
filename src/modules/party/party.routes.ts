@@ -220,12 +220,15 @@ router.get(
         debit: Number(inv.total),
         credit: 0,
       });
+    // Show which bill a linked voucher settled, so a lump sum split across
+    // several bills reads as such on the statement.
+    const billNo = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
     for (const p of payments) {
       const reduces = p.direction === reduceDir;
       entries.push({
         date: p.paymentDate,
         kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
-        ref: "",
+        ref: (p.invoiceId && billNo.get(p.invoiceId)) || "",
         debit: reduces ? 0 : Number(p.amount),
         credit: reduces ? Number(p.amount) : 0,
       });
