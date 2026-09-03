@@ -7,7 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
-import { recomputeInvoiceSettlement } from "../../lib/settlement";
+import { applyPartyAdvances, recomputeInvoiceSettlement } from "../../lib/settlement";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 
 const router = Router();
@@ -275,7 +275,17 @@ router.post(
         }
       }
 
-      return created;
+      // Money this party paid ahead (a receipt with no bill to land on at the
+      // time) settles the new bill immediately, so the bill and the ledger
+      // agree from the moment it is raised. Re-read so the response carries
+      // the settled amount/status rather than the pre-allocation row.
+      const applied = await applyPartyAdvances(tx, businessId, body.partyId);
+      return applied > 0
+        ? tx.invoice.findUniqueOrThrow({
+            where: { id: created.id },
+            include: { items: true, party: true },
+          })
+        : created;
     });
 
     res.status(201).json({ invoice });

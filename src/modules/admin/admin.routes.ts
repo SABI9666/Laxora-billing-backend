@@ -7,6 +7,7 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
+import { reconcilePayments } from "../../lib/settlement";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
@@ -1177,6 +1178,20 @@ router.get(
   })
 );
 
+// POST /api/admin/reconcile-payments — one-click, idempotent repair: spreads
+// every settling voucher that has a party but no bill across that party's
+// open bills (oldest first), then re-derives any bill still marked PARTIAL so
+// paise leftovers clear. The same pass runs on every API start; this lets an
+// admin trigger it immediately, for one shop (?businessId=) or all.
+router.post(
+  "/reconcile-payments",
+  asyncHandler(async (req, res) => {
+    const businessId = req.query.businessId ? String(req.query.businessId) : undefined;
+    const result = await reconcilePayments(prisma, businessId);
+    res.json(result);
+  })
+);
+
 // POST /api/admin/stock/backfill-entry-dates — one-click, idempotent backfill:
 // for every in-stock, non-service product that has no inward (entry) movement
 // yet, insert an "Opening stock" IN movement dated today so it gets an entry
@@ -1758,12 +1773,15 @@ router.get(
         credit: 0,
       });
     }
+    // Show which bill a linked voucher settled, so a lump sum split across
+    // several bills reads as such on the statement.
+    const billNo = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
     for (const p of payments) {
       const reduces = p.direction === reduceDir;
       entries.push({
         date: p.paymentDate,
         kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
-        ref: "",
+        ref: (p.invoiceId && billNo.get(p.invoiceId)) || "",
         debit: reduces ? 0 : Number(p.amount),
         credit: reduces ? Number(p.amount) : 0,
       });

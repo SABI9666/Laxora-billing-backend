@@ -4,13 +4,17 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
-import { recomputeInvoiceSettlement } from "../../lib/settlement";
+import { recomputeInvoiceSettlement, settleAgainstOpenBills } from "../../lib/settlement";
 
 const router = Router();
 
 const paymentSchema = z.object({
   partyId: z.string().optional(),
   invoiceId: z.string().optional(),
+  // Several bills settled by one voucher: the amount clears these oldest
+  // first; anything beyond them spills to the party's other open bills, and
+  // what is still left stays on the ledger as an advance.
+  invoiceIds: z.array(z.string().min(1)).optional(),
   // IN = credit voucher (money received), OUT = payment voucher (money given).
   direction: z.enum(["IN", "OUT"]).default("IN"),
   // Supplier Payment | Customer Receipt | Expense | Bank Deposit | Bank Withdrawal | Other
@@ -76,78 +80,155 @@ router.post(
     const autoAllocate =
       !body.invoiceId && !!body.partyId && (settlesSales || settlesPurchases);
 
+    // The bill a receipt is recorded against also tells us the party, so a
+    // receipt that overshoots that bill can still spill onto the party's other
+    // open bills below.
+    const linkedInvoice = body.invoiceId
+      ? await prisma.invoice.findFirst({ where: { id: body.invoiceId, businessId } })
+      : null;
+
+    // Bills the accountant ticked. They must all exist here and belong to the
+    // same party, which then also stands in for a missing partyId.
+    const chosenIds = [...new Set((body.invoiceIds ?? []).filter(Boolean))];
+    const chosen = chosenIds.length
+      ? await prisma.invoice.findMany({
+          where: { id: { in: chosenIds }, businessId },
+          select: { id: true, partyId: true },
+        })
+      : [];
+    if (chosen.length !== chosenIds.length)
+      throw badRequest("One of the selected bills was not found for this business");
+
+    const partyId = body.partyId ?? linkedInvoice?.partyId ?? chosen[0]?.partyId ?? null;
+    if (chosen.some((c) => c.partyId !== partyId))
+      throw badRequest("The selected bills belong to different parties");
+
     const payment = await prisma.$transaction(async (tx) => {
       const common = {
         businessId,
-        partyId: body.partyId ?? null,
+        partyId,
         direction: body.direction,
         purpose: body.purpose ?? null,
         method: body.method,
         paymentDate: body.paymentDate ?? new Date(),
         notes: body.notes ?? null,
       };
+      const settling = settlesSales || settlesPurchases;
+
+      // Accountant picked the bills: clear those oldest first, then let any
+      // excess run on to the party's other open bills, then keep the rest as
+      // an advance. Returns the first part created so the caller has a row.
+      if (chosenIds.length && settling && partyId && !body.invoiceId) {
+        const voucher = { ...common, partyId };
+        const picked = await settleAgainstOpenBills(tx, voucher, body.amount, {
+          onlyInvoiceIds: chosenIds,
+        });
+        let remaining = picked.remaining;
+        let firstId: string | undefined = picked.paymentIds[0];
+        if (remaining > 0.009) {
+          const spill = await settleAgainstOpenBills(tx, voucher, remaining, {
+            excludeInvoiceIds: chosenIds,
+          });
+          remaining = spill.remaining;
+          firstId = firstId ?? spill.paymentIds[0];
+        }
+        if (remaining > 0.009 || !firstId) {
+          const advance = await tx.payment.create({
+            data: {
+              ...common,
+              invoiceId: null,
+              amount: remaining > 0.009 ? remaining : body.amount,
+            },
+          });
+          firstId = firstId ?? advance.id;
+        }
+        return tx.payment.findUniqueOrThrow({ where: { id: firstId } });
+      }
 
       if (autoAllocate) {
-        const open = await tx.invoice.findMany({
-          where: {
-            businessId,
-            partyId: body.partyId!,
-            type: settlesSales ? "SALE" : "PURCHASE",
-            status: { in: ["UNPAID", "PARTIAL"] },
-          },
-          orderBy: { invoiceDate: "asc" },
-        });
-        // Goods returned against a bill already cut what the customer owes on
-        // it, so they must come off the due before a receipt is allocated —
-        // otherwise money lands on a bill that is really settled and the
-        // customer's next genuinely-pending bill stays open.
-        const cnRows = open.length
-          ? await tx.creditNote.groupBy({
-              by: ["invoiceId"],
-              where: { businessId, invoiceId: { in: open.map((i) => i.id) } },
-              _sum: { totalAmount: true },
-            })
-          : [];
-        const returnedMap = new Map(
-          cnRows.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
+        const { remaining, paymentIds } = await settleAgainstOpenBills(
+          tx,
+          { ...common, partyId: partyId! },
+          body.amount
         );
-        let remaining = body.amount;
-        let first = null;
-        for (const inv of open) {
-          if (remaining <= 0.009) break;
-          const due =
-            Number(inv.total) - Number(inv.amountPaid) - (returnedMap.get(inv.id) ?? 0);
-          if (due <= 0.009) continue;
-          const part = Math.round(Math.min(remaining, due) * 100) / 100;
-          const created = await tx.payment.create({
-            data: { ...common, invoiceId: inv.id, amount: part },
-          });
-          first = first ?? created;
-          await recomputeInvoiceSettlement(tx, inv.id);
-          remaining = Math.round((remaining - part) * 100) / 100;
-        }
         // Anything left over (advance / no open bills) stays as an unlinked
         // receipt on the party's ledger.
-        if (remaining > 0.009 || !first) {
-          const created = await tx.payment.create({
+        if (remaining > 0.009 || paymentIds.length === 0) {
+          return tx.payment.create({
             data: { ...common, invoiceId: null, amount: remaining > 0.009 ? remaining : body.amount },
           });
-          first = first ?? created;
         }
-        return first;
+        return tx.payment.findUniqueOrThrow({ where: { id: paymentIds[0] } });
       }
 
-      const created = await tx.payment.create({
-        data: { ...common, invoiceId: body.invoiceId ?? null, amount: body.amount },
-      });
-
-      // If linked to an invoice, recompute amountPaid and status (payments
-      // plus any bill-linked charges).
-      if (body.invoiceId) {
-        await recomputeInvoiceSettlement(tx, body.invoiceId);
+      // Recorded against one specific bill. A settling voucher only ever
+      // clears THAT bill's outstanding due; if the customer handed over more
+      // (one cheque for several bills is common), the excess moves on to
+      // their other open bills, oldest first, and whatever is still left is
+      // kept as an advance. Without this the extra was silently swallowed —
+      // amountPaid is capped at the bill total — so the ledger showed the
+      // customer paid up while their other bills stayed pending.
+      let amountHere = body.amount;
+      let excess = 0;
+      if (linkedInvoice && settling && partyId) {
+        const returned =
+          linkedInvoice.type === "SALE"
+            ? Number(
+                (
+                  await tx.creditNote.aggregate({
+                    where: { businessId, invoiceId: linkedInvoice.id },
+                    _sum: { totalAmount: true },
+                  })
+                )._sum.totalAmount ?? 0
+              )
+            : 0;
+        const due = Math.max(
+          0,
+          Math.round(
+            (Number(linkedInvoice.total) - Number(linkedInvoice.amountPaid) - returned) * 100
+          ) / 100
+        );
+        if (body.amount > due + 0.009) {
+          amountHere = due;
+          excess = Math.round((body.amount - due) * 100) / 100;
+        }
       }
 
-      return created;
+      let created = null;
+      if (amountHere > 0.009) {
+        created = await tx.payment.create({
+          data: { ...common, invoiceId: body.invoiceId ?? null, amount: amountHere },
+        });
+        // If linked to an invoice, recompute amountPaid and status (payments
+        // plus any bill-linked charges).
+        if (body.invoiceId) await recomputeInvoiceSettlement(tx, body.invoiceId);
+      }
+
+      if (excess > 0.009) {
+        const { remaining, paymentIds } = await settleAgainstOpenBills(
+          tx,
+          { ...common, partyId: partyId! },
+          excess,
+          { excludeInvoiceIds: [linkedInvoice!.id] }
+        );
+        if (remaining > 0.009) {
+          const advance = await tx.payment.create({
+            data: { ...common, invoiceId: null, amount: remaining },
+          });
+          created = created ?? advance;
+        } else if (!created && paymentIds.length) {
+          created = await tx.payment.findUniqueOrThrow({ where: { id: paymentIds[0] } });
+        }
+      }
+
+      // Only reachable if the bill was already settled and nothing spilled —
+      // record the voucher on the bill anyway so the money is not lost.
+      return (
+        created ??
+        (await tx.payment.create({
+          data: { ...common, invoiceId: body.invoiceId ?? null, amount: body.amount },
+        }))
+      );
     });
 
     res.status(201).json({ payment });

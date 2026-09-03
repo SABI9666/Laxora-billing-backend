@@ -1,7 +1,7 @@
 import { createApp } from "./app";
 import { env } from "./config/env";
 import { prisma } from "./lib/prisma";
-import { recomputeAllLinkedInvoiceSettlements } from "./lib/settlement";
+import { recomputeAllLinkedInvoiceSettlements, reconcilePayments } from "./lib/settlement";
 
 const app = createApp();
 
@@ -17,6 +17,18 @@ const server = app.listen(env.port, "0.0.0.0", () => {
       if (n > 0) console.log(`Settlement backfill checked ${n} bill(s)`);
     })
     .catch((e) => console.error("Settlement backfill failed:", e));
+
+  // Receipts recorded before they were allocated to bills sit on the party
+  // ledger but leave the bills pending. Spread them across the open bills so
+  // the ledger and the bill list agree. Idempotent — later boots find nothing.
+  reconcilePayments(prisma)
+    .then(({ allocated, rechecked }) => {
+      if (allocated > 0 || rechecked > 0)
+        console.log(
+          `Payment reconcile: ${allocated} voucher(s) allocated to bills, ${rechecked} partial bill(s) rechecked`
+        );
+    })
+    .catch((e) => console.error("Payment reconcile failed:", e));
 });
 
 // Graceful shutdown so in-flight requests finish on container stop.
