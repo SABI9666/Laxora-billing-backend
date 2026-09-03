@@ -19,7 +19,10 @@ const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 // Builds an optional invoiceDate range filter from ?from=&to= query params.
 function dateRange(req: { query: Record<string, unknown> }) {
   const from = req.query.from ? new Date(String(req.query.from)) : undefined;
-  const to = req.query.to ? new Date(String(req.query.to)) : undefined;
+  const toRaw = req.query.to ? String(req.query.to) : undefined;
+  const to = toRaw ? new Date(toRaw) : undefined;
+  // A bare "to" date means the whole of that day, not its first instant.
+  if (to && /^\d{4}-\d{2}-\d{2}$/.test(toRaw!)) to.setUTCHours(23, 59, 59, 999);
   const filter =
     from || to
       ? { invoiceDate: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } }
@@ -1616,8 +1619,142 @@ router.get(
         };
       });
 
+    // ---- Every individual movement in the period, in time order, with the
+    // cash and bank balance after each one — the transaction-level cash book
+    // and bank book the admin can expand a day into or download. ------------
+    const periodWhere = <K extends string>(field: K) =>
+      from || to
+        ? ({ [field]: { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) } } as Record<
+            K,
+            { gte?: Date; lte?: Date }
+          >)
+        : ({} as Record<K, never>);
+    const [payRows, expRows] = await Promise.all([
+      prisma.payment.findMany({
+        where: { businessId: id, ...periodWhere("paymentDate") },
+        include: {
+          party: { select: { name: true } },
+          invoice: { select: { invoiceNumber: true } },
+        },
+        orderBy: [{ paymentDate: "asc" }, { createdAt: "asc" }],
+        take: 5000,
+      }),
+      prisma.expense.findMany({
+        where: { businessId: id, method: { not: null }, ...periodWhere("date") },
+        orderBy: [{ date: "asc" }, { createdAt: "asc" }],
+        take: 5000,
+      }),
+    ]);
+    const expInvIds = [...new Set(expRows.map((e) => e.invoiceId).filter((x): x is string => !!x))];
+    const expInvNos = new Map(
+      (expInvIds.length
+        ? await prisma.invoice.findMany({
+            where: { id: { in: expInvIds } },
+            select: { id: true, invoiceNumber: true },
+          })
+        : []
+      ).map((i) => [i.id, i.invoiceNumber])
+    );
+
+    type Txn = {
+      id: string;
+      date: Date;
+      // What happened, in the shop's words.
+      kind: "RECEIPT" | "PAYMENT" | "EXPENSE" | "DEPOSIT" | "WITHDRAWAL";
+      // Which book it belongs to; a transfer touches both.
+      book: "CASH" | "BANK" | "TRANSFER";
+      method: string;
+      party: string | null;
+      bill: string | null;
+      purpose: string | null;
+      notes: string | null;
+      cashIn: number;
+      cashOut: number;
+      bankIn: number;
+      bankOut: number;
+      cashBalance: number;
+      bankBalance: number;
+    };
+    const raw: Omit<Txn, "cashBalance" | "bankBalance">[] = [];
+    for (const p of payRows) {
+      const amt = Number(p.amount);
+      const base = {
+        id: p.id,
+        date: p.paymentDate,
+        method: p.method,
+        party: p.party?.name ?? null,
+        bill: p.invoice?.invoiceNumber ?? null,
+        purpose: p.purpose,
+        notes: p.notes,
+        cashIn: 0,
+        cashOut: 0,
+        bankIn: 0,
+        bankOut: 0,
+      };
+      if (p.purpose === "Bank Deposit")
+        raw.push({ ...base, kind: "DEPOSIT", book: "TRANSFER", cashOut: amt, bankIn: amt });
+      else if (p.purpose === "Bank Withdrawal")
+        raw.push({ ...base, kind: "WITHDRAWAL", book: "TRANSFER", bankOut: amt, cashIn: amt });
+      else {
+        const cashBook = p.method === "CASH";
+        if (p.direction === "IN")
+          raw.push({
+            ...base,
+            kind: "RECEIPT",
+            book: cashBook ? "CASH" : "BANK",
+            cashIn: cashBook ? amt : 0,
+            bankIn: cashBook ? 0 : amt,
+          });
+        else
+          raw.push({
+            ...base,
+            kind: "PAYMENT",
+            book: cashBook ? "CASH" : "BANK",
+            cashOut: cashBook ? amt : 0,
+            bankOut: cashBook ? 0 : amt,
+          });
+      }
+    }
+    for (const e of expRows) {
+      const amt = Number(e.amount);
+      const cashBook = e.method === "CASH";
+      raw.push({
+        id: e.id,
+        date: e.date,
+        kind: "EXPENSE",
+        book: cashBook ? "CASH" : "BANK",
+        method: e.method ?? "CASH",
+        party: null,
+        bill: e.invoiceId ? expInvNos.get(e.invoiceId) ?? null : null,
+        purpose: e.category,
+        notes: e.note,
+        cashIn: 0,
+        cashOut: cashBook ? amt : 0,
+        bankIn: 0,
+        bankOut: cashBook ? 0 : amt,
+      });
+    }
+    raw.sort((a, b) => a.date.getTime() - b.date.getTime());
+    let runCash = openingCash;
+    let runBank = openingBank;
+    const transactions: Txn[] = raw.map((t) => {
+      runCash = round2(runCash + t.cashIn - t.cashOut);
+      runBank = round2(runBank + t.bankIn - t.bankOut);
+      return {
+        ...t,
+        cashIn: round2(t.cashIn),
+        cashOut: round2(t.cashOut),
+        bankIn: round2(t.bankIn),
+        bankOut: round2(t.bankOut),
+        cashBalance: runCash,
+        bankBalance: runBank,
+      };
+    });
+
     res.json({
       shop: business.name,
+      from: from ?? null,
+      to: to ?? null,
       openingCash,
       openingBank,
       cashBalance: round2(cash),
@@ -1627,6 +1764,7 @@ router.get(
       toReceive: round2(receivables.reduce((s, b) => s + b.due, 0)),
       toPay: round2(payables.reduce((s, b) => s + b.due, 0)),
       days,
+      transactions,
       receivables,
       payables,
     });
