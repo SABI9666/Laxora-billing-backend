@@ -1634,7 +1634,7 @@ router.get(
         where: { businessId: id, ...periodWhere("paymentDate") },
         include: {
           party: { select: { name: true } },
-          invoice: { select: { invoiceNumber: true } },
+          invoice: { select: { invoiceNumber: true, invoiceDate: true } },
         },
         orderBy: [{ paymentDate: "asc" }, { createdAt: "asc" }],
         take: 5000,
@@ -1650,10 +1650,10 @@ router.get(
       (expInvIds.length
         ? await prisma.invoice.findMany({
             where: { id: { in: expInvIds } },
-            select: { id: true, invoiceNumber: true },
+            select: { id: true, invoiceNumber: true, invoiceDate: true },
           })
         : []
-      ).map((i) => [i.id, i.invoiceNumber])
+      ).map((i) => [i.id, i])
     );
 
     type Txn = {
@@ -1666,6 +1666,8 @@ router.get(
       method: string;
       party: string | null;
       bill: string | null;
+      // When that bill was raised, so "Bill 26-27700 dt 20 Aug" reads on its own.
+      billDate: Date | null;
       purpose: string | null;
       notes: string | null;
       cashIn: number;
@@ -1684,6 +1686,7 @@ router.get(
         method: p.method,
         party: p.party?.name ?? null,
         bill: p.invoice?.invoiceNumber ?? null,
+        billDate: p.invoice?.invoiceDate ?? null,
         purpose: p.purpose,
         notes: p.notes,
         cashIn: 0,
@@ -1725,7 +1728,8 @@ router.get(
         book: cashBook ? "CASH" : "BANK",
         method: e.method ?? "CASH",
         party: null,
-        bill: e.invoiceId ? expInvNos.get(e.invoiceId) ?? null : null,
+        bill: e.invoiceId ? expInvNos.get(e.invoiceId)?.invoiceNumber ?? null : null,
+        billDate: e.invoiceId ? expInvNos.get(e.invoiceId)?.invoiceDate ?? null : null,
         purpose: e.category,
         notes: e.note,
         cashIn: 0,
