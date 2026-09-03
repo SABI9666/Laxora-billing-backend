@@ -7,6 +7,16 @@ const inr = (n: number) =>
   "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const dayKey = (d: Date) => d.toISOString().slice(0, 10);
 
+// One goods line shown under a ledger entry: what was billed, added, returned
+// or taken in exchange. Rate and amount are what the customer pays (incl.
+// GST), so the lines add up to the entry's figure.
+export type LedgerItem = {
+  description: string;
+  quantity: number;
+  rate: number;
+  amount: number;
+};
+
 export type LedgerEntry = {
   date: Date;
   kind: string;
@@ -14,6 +24,8 @@ export type LedgerEntry = {
   // Free-text detail under the line: a return's reason, a charge's note, how
   // something was settled.
   note?: string;
+  // Goods behind the figure, when there are any.
+  items?: LedgerItem[];
   debit: number;
   credit: number;
 };
@@ -53,25 +65,60 @@ export async function buildPartyLedger(
   totals: LedgerTotals;
   closingBalance: number;
 }> {
+  const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
   const businessId = party.businessId;
   const invoiceType: "SALE" | "PURCHASE" = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
   // A payment in the party's usual direction (customer pays IN, we pay a
   // supplier OUT) reduces what's owed; the opposite direction is a refund.
   const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
 
+  const invoiceSelect = {
+    id: true,
+    invoiceNumber: true,
+    invoiceDate: true,
+    createdAt: true,
+    total: true,
+    amountPaid: true,
+  } as const;
+  const itemSelect = {
+    id: true,
+    itemId: true,
+    description: true,
+    quantity: true,
+    rate: true,
+    taxRate: true,
+    amount: true,
+  } as const;
+  type InvoiceRow = Prisma.InvoiceGetPayload<{ select: typeof invoiceSelect }> & {
+    items: Array<Prisma.InvoiceItemGetPayload<{ select: typeof itemSelect }> & { createdAt: Date }>;
+  };
+
+  // InvoiceItem.createdAt is applied by hand (prisma/invoice-item-created-at.sql).
+  // Until it exists on this database the ledger must still open, so fall
+  // back to treating every line as part of the original bill.
+  const loadInvoices = async (): Promise<InvoiceRow[]> => {
+    const where = { partyId: party.id, businessId, type: invoiceType };
+    try {
+      return await db.invoice.findMany({
+        where,
+        select: { ...invoiceSelect, items: { select: { ...itemSelect, createdAt: true } } },
+      });
+    } catch (err) {
+      const code = (err as { code?: string })?.code;
+      if (code !== "P2022" && code !== "P2010") throw err;
+      const rows = await db.invoice.findMany({
+        where,
+        select: { ...invoiceSelect, items: { select: itemSelect } },
+      });
+      return rows.map((r) => ({
+        ...r,
+        items: r.items.map((it) => ({ ...it, createdAt: r.createdAt })),
+      }));
+    }
+  };
+
   const [invoices, payments, creditNotes] = await Promise.all([
-    db.invoice.findMany({
-      where: { partyId: party.id, businessId, type: invoiceType },
-      select: {
-        id: true,
-        invoiceNumber: true,
-        invoiceDate: true,
-        createdAt: true,
-        total: true,
-        amountPaid: true,
-        items: { select: { id: true, amount: true, taxRate: true, createdAt: true } },
-      },
-    }),
+    loadInvoices(),
     db.payment.findMany({
       where: { partyId: party.id, businessId },
       select: {
@@ -93,6 +140,7 @@ export async function buildPartyLedger(
         invoiceId: true,
         reason: true,
         refundMethod: true,
+        lines: true,
         exchangeLines: true,
       },
     }),
@@ -110,22 +158,71 @@ export async function buildPartyLedger(
   const billNo = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
 
   // ---- Bills: the original value on the bill's date, later additions and
-  // exchange replacements as their own dated lines. ------------------------
-  type ExchangeLine = { invoiceItemId?: string; amount?: number; taxRate?: number };
+  // exchange replacements as their own dated lines, each listing its goods. --
+  type ExchangeLine = {
+    invoiceItemId?: string;
+    itemId?: string | null;
+    quantity?: number;
+    rate?: number;
+    taxRate?: number;
+    amount?: number;
+  };
+  type ReturnLine = {
+    invoiceItemId?: string;
+    itemId?: string | null;
+    quantity?: number;
+    rate?: number;
+    taxRate?: number;
+  };
+  const asLines = <T,>(v: unknown): T[] => (Array.isArray(v) ? (v as T[]) : []);
+
   const exchangeItemIds = new Set<string>();
   for (const cn of creditNotes)
-    for (const l of (Array.isArray(cn.exchangeLines) ? cn.exchangeLines : []) as ExchangeLine[])
+    for (const l of asLines<ExchangeLine>(cn.exchangeLines))
       if (l.invoiceItemId) exchangeItemIds.add(l.invoiceItemId);
 
   const gross = (amount: Prisma.Decimal | number, taxRate: Prisma.Decimal | number) =>
     Number(amount) * (1 + Number(taxRate) / 100);
+
+  type Line = InvoiceRow["items"][number];
+  const lineItem = (it: Line): LedgerItem => ({
+    description: it.description,
+    quantity: round3(Number(it.quantity)),
+    rate: round2(gross(it.rate, it.taxRate)),
+    amount: round2(gross(it.amount, it.taxRate)),
+  });
+
+  // Bill lines by id so returns and exchanges can name the goods they refer to.
+  const lineById = new Map<string, Line>();
+  for (const inv of invoices) for (const it of inv.items) lineById.set(it.id, it);
+
+  // Old return notes only carry an itemId — resolve those to product names.
+  const wantNames = new Set<string>();
+  for (const cn of creditNotes)
+    for (const l of asLines<ReturnLine>(cn.lines))
+      if (!(l.invoiceItemId && lineById.has(l.invoiceItemId)) && l.itemId) wantNames.add(l.itemId);
+  const itemName = new Map<string, string>();
+  if (wantNames.size) {
+    const named = await db.item.findMany({
+      where: { id: { in: [...wantNames] } },
+      select: { id: true, name: true },
+    });
+    for (const n of named) itemName.set(n.id, n.name);
+  }
+  const describe = (l: { invoiceItemId?: string; itemId?: string | null }, fallback: string) =>
+    (l.invoiceItemId && lineById.get(l.invoiceItemId)?.description) ||
+    (l.itemId && itemName.get(l.itemId)) ||
+    fallback;
+
+  const countNote = (n: number, what: string) => `${n} ${what}${n === 1 ? "" : "s"}`;
 
   for (const inv of invoices) {
     totals.billed += Number(inv.total);
     // Anything stamped well after the bill was created was added later.
     const cutoff = inv.createdAt.getTime() + 10 * 60 * 1000;
     let laterGross = 0;
-    const byDay = new Map<string, { date: Date; gross: number; count: number }>();
+    const original: LedgerItem[] = [];
+    const byDay = new Map<string, { date: Date; gross: number; items: LedgerItem[] }>();
     for (const it of inv.items) {
       const g = gross(it.amount, it.taxRate);
       if (exchangeItemIds.has(it.id)) {
@@ -135,17 +232,21 @@ export async function buildPartyLedger(
       if (it.createdAt.getTime() > cutoff) {
         laterGross += g;
         const k = dayKey(it.createdAt);
-        const cur = byDay.get(k) ?? { date: it.createdAt, gross: 0, count: 0 };
+        const cur = byDay.get(k) ?? { date: it.createdAt, gross: 0, items: [] };
         cur.gross += g;
-        cur.count += 1;
+        cur.items.push(lineItem(it));
         if (it.createdAt < cur.date) cur.date = it.createdAt;
         byDay.set(k, cur);
+        continue;
       }
+      original.push(lineItem(it));
     }
     entries.push({
       date: inv.invoiceDate,
       kind: invoiceType === "SALE" ? "Sale Invoice" : "Purchase Invoice",
       ref: inv.invoiceNumber,
+      note: original.length ? countNote(original.length, "item") : undefined,
+      items: original,
       debit: round2(Number(inv.total) - laterGross),
       credit: 0,
     });
@@ -154,7 +255,8 @@ export async function buildPartyLedger(
         date: add.date,
         kind: "Items added",
         ref: inv.invoiceNumber,
-        note: `${add.count} line${add.count === 1 ? "" : "s"} added to the bill later`,
+        note: `${countNote(add.items.length, "item")} added to the bill after it was raised`,
+        items: add.items,
         debit: round2(add.gross),
         credit: 0,
       });
@@ -178,7 +280,16 @@ export async function buildPartyLedger(
       ref: (p.invoiceId && billNo.get(p.invoiceId)) || "",
       note: isReturnRefund
         ? "money handed back on a return — this amount is owed again"
-        : p.notes ?? undefined,
+        : [
+            reduces
+              ? p.invoiceId
+                ? "received against this bill"
+                : "on account — not tied to a bill, adjusts the running balance"
+              : undefined,
+            p.notes || undefined,
+          ]
+            .filter(Boolean)
+            .join(" · ") || undefined,
       debit: reduces ? 0 : amt,
       credit: reduces ? amt : 0,
     });
@@ -188,30 +299,57 @@ export async function buildPartyLedger(
   for (const cn of creditNotes) {
     const amt = Number(cn.totalAmount);
     totals.returns += amt;
-    const lines = (Array.isArray(cn.exchangeLines) ? cn.exchangeLines : []) as ExchangeLine[];
-    const isExchange = lines.length > 0;
+    const exchLines = asLines<ExchangeLine>(cn.exchangeLines);
+    const isExchange = exchLines.length > 0;
+
+    const returnedItems: LedgerItem[] = asLines<ReturnLine>(cn.lines).map((l) => {
+      const qty = Number(l.quantity ?? 0);
+      const rate = gross(l.rate ?? 0, l.taxRate ?? 0);
+      return {
+        description: describe(l, "Returned goods"),
+        quantity: round3(qty),
+        rate: round2(rate),
+        amount: round2(qty * rate),
+      };
+    });
+
     const bits: string[] = [];
+    if (returnedItems.length) bits.push(`${countNote(returnedItems.length, "item")} taken back`);
     if (cn.reason) bits.push(cn.reason);
     bits.push(
       cn.refundMethod
         ? `refunded via ${cn.refundMethod.toLowerCase()} — see the refund line`
-        : "reduces what is owed on the bill"
+        : "adjusted against the bill, no money handed back"
     );
     entries.push({
       date: cn.date,
       kind: isExchange ? "Sales Return (exchange)" : "Sales Return",
       ref: cn.invoiceNumber ?? "",
       note: bits.join(" · "),
+      items: returnedItems,
       debit: 0,
       credit: amt,
     });
     if (isExchange) {
-      const taken = lines.reduce((s, l) => s + gross(l.amount ?? 0, l.taxRate ?? 0), 0);
+      const takenItems: LedgerItem[] = exchLines.map((l) => {
+        const line = l.invoiceItemId ? lineById.get(l.invoiceItemId) : undefined;
+        if (line) return lineItem(line);
+        const qty = Number(l.quantity ?? 0);
+        const rate = gross(l.rate ?? 0, l.taxRate ?? 0);
+        return {
+          description: describe(l, "Replacement goods"),
+          quantity: round3(qty),
+          rate: round2(rate),
+          amount: round2(l.amount != null ? gross(l.amount, l.taxRate ?? 0) : qty * rate),
+        };
+      });
+      const taken = takenItems.reduce((s, i) => s + i.amount, 0);
       entries.push({
         date: cn.date,
         kind: "Exchange: items taken",
         ref: cn.invoiceNumber ?? "",
-        note: `${lines.length} replacement line${lines.length === 1 ? "" : "s"} put on the same bill`,
+        note: `${countNote(takenItems.length, "replacement item")} put on the same bill`,
+        items: takenItems,
         debit: round2(taken),
         credit: 0,
       });
@@ -335,7 +473,17 @@ export async function buildPartyLedger(
     }
   }
 
-  entries.sort((a, b) => a.date.getTime() - b.date.getTime());
+  // Same-day order reads like the day happened: bill, additions, returns
+  // and exchanges, then the money that moved because of them.
+  const rank = (e: LedgerEntry) =>
+    /Invoice$/.test(e.kind) ? 0
+    : e.kind === "Items added" ? 1
+    : e.kind.startsWith("Sales Return") ? 2
+    : e.kind.startsWith("Exchange") ? 3
+    : e.kind.startsWith("Payment") ? 4
+    : /refund/i.test(e.kind) ? 5
+    : 6;
+  entries.sort((a, b) => a.date.getTime() - b.date.getTime() || rank(a) - rank(b));
 
   let balance = Number(party.openingBalance);
   const ledger = entries.map((e) => {
@@ -345,6 +493,7 @@ export async function buildPartyLedger(
       kind: e.kind,
       ref: e.ref,
       note: e.note ?? "",
+      items: e.items ?? [],
       debit: round2(e.debit),
       credit: round2(e.credit),
       balance: round2(balance),
