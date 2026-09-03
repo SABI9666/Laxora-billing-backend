@@ -410,6 +410,17 @@ model Expense {
   // How it was paid: "CASH" or "BANK". When set, the cash book reduces that
   // balance by the expense. Null = not a cash movement (e.g. bill charge).
   method      String?
+  // For a bill-linked charge, what actually happened to the money:
+  //   ADJUST        — deducted from what the party owes on the bill; no cash
+  //                   moves. Settles the bill (counts toward amountPaid).
+  //   PAID_TO_PARTY — cash/bank handed to the bill's party (a commission given
+  //                   to the electrician). Does NOT settle the bill; the ledger
+  //                   shows the amount earned and the amount paid, netting out.
+  //   PAID_TO_OTHER — cash/bank paid to a third party (a transporter). Does
+  //                   NOT settle the bill; a memo on the party's ledger only.
+  //   null          — recorded before this existed: settles the bill and hits
+  //                   the cash book when `method` is set (legacy behaviour).
+  settlement  String?
   date        DateTime @default(now())
   createdById String?
   createdAt   DateTime @default(now())

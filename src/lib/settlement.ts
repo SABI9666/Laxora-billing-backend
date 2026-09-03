@@ -24,7 +24,14 @@ export async function recomputeInvoiceSettlement(db: Db, invoiceId: string) {
       where: { invoiceId },
       _sum: { amount: true },
     }),
-    db.expense.aggregate({ where: { invoiceId }, _sum: { amount: true } }),
+    // Only charges that were DEDUCTED from the bill settle it. A charge paid
+    // out in cash (to the party or a third party) is the shop's cost — the
+    // customer still owes that part — so it must not count. Rows from before
+    // `settlement` existed are NULL and keep settling, as they always did.
+    db.expense.aggregate({
+      where: { invoiceId, OR: [{ settlement: null }, { settlement: "ADJUST" }] },
+      _sum: { amount: true },
+    }),
   ]);
 
   // A sale is settled by money coming IN; a purchase by money going OUT. An

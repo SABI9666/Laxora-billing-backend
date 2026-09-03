@@ -1684,6 +1684,7 @@ router.get(
             category: true,
             note: true,
             method: true,
+            settlement: true,
           },
         })
       : [];
@@ -1693,6 +1694,7 @@ router.get(
       category: string;
       note: string | null;
       method: string | null;
+      settlement: string | null;
     };
     const chargesByInv = new Map<string, Charge[]>();
     for (const x of billCharges) {
@@ -1703,6 +1705,7 @@ router.get(
         category: x.category,
         note: x.note,
         method: x.method,
+        settlement: x.settlement,
       });
       chargesByInv.set(x.invoiceId!, arr);
     }
@@ -1766,20 +1769,28 @@ router.get(
     const inr = (n: number) =>
       "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const r2c = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+    const isPayout = (c: Charge) =>
+      c.settlement === "PAID_TO_PARTY" || c.settlement === "PAID_TO_OTHER";
     for (const inv of invoices) {
       const charges = chargesByInv.get(inv.id);
       if (!charges) continue;
+      const name = (c: Charge) => (c.category === "Other" ? "Other charge" : c.category);
+      const sorted = [...charges].sort((a, b) => a.date.getTime() - b.date.getTime());
+
+      // Deductions share the bill's settling budget in date order.
       let budget = Math.max(0, Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0));
-      for (const c of [...charges].sort((a, b) => a.date.getTime() - b.date.getTime())) {
+      for (const c of sorted) {
+        if (isPayout(c)) continue;
         const settled = r2c(Math.min(c.amount, budget));
         budget = r2c(budget - settled);
         const unsettled = r2c(c.amount - settled);
-        const how = c.method
-          ? `paid out via ${c.method.toLowerCase()}`
-          : "adjusted against the bill, no cash paid";
         const bits: string[] = [];
         if (c.note) bits.push(c.note);
-        bits.push(how);
+        bits.push(
+          c.method
+            ? `paid out via ${c.method.toLowerCase()}`
+            : "adjusted against the bill, no cash paid"
+        );
         if (unsettled > 0.009) {
           bits.push(
             settled > 0.009
@@ -1791,12 +1802,56 @@ router.get(
         }
         entries.push({
           date: c.date,
-          kind: c.category === "Other" ? "Other charge" : c.category,
+          kind: name(c),
           ref: inv.invoiceNumber,
           note: bits.join(" · "),
           debit: 0,
           credit: settled,
         });
+      }
+
+      // Payouts never touch the bill's due. Money handed to the party itself
+      // (a commission given to the electrician) is shown as the amount they
+      // EARNED on the bill and, right after it, the amount PAID to them — a
+      // matched pair, both visible, netting to nothing owed. Money paid to a
+      // third party is the shop's cost and only a memo here.
+      for (const c of sorted) {
+        if (!isPayout(c)) continue;
+        const via = (c.method ?? "CASH").toUpperCase();
+        if (c.settlement === "PAID_TO_PARTY") {
+          entries.push({
+            date: c.date,
+            kind: `${name(c)} earned`,
+            ref: inv.invoiceNumber,
+            note: [c.note, "commission/charge due to this party on the bill"]
+              .filter(Boolean)
+              .join(" · "),
+            debit: 0,
+            credit: c.amount,
+          });
+          entries.push({
+            date: c.date,
+            kind: `${name(c)} paid (${via})`,
+            ref: inv.invoiceNumber,
+            note: `handed over via ${via.toLowerCase()} — the bill itself is not reduced`,
+            debit: c.amount,
+            credit: 0,
+          });
+        } else {
+          entries.push({
+            date: c.date,
+            kind: name(c),
+            ref: inv.invoiceNumber,
+            note: [
+              c.note,
+              `${inr(c.amount)} paid via ${via.toLowerCase()} to a third party — the shop's cost, not this party's account`,
+            ]
+              .filter(Boolean)
+              .join(" · "),
+            debit: 0,
+            credit: 0,
+          });
+        }
       }
     }
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
