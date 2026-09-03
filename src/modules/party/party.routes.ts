@@ -286,6 +286,17 @@ router.get(
     const inr = (n: number) =>
       "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
     const r2c = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
+    // Reconciliation footer: the same figures the party list is built from,
+    // so "Billed" there and the statement here visibly agree. Charges allowed
+    // or given are shown separately — they are not receipts.
+    const totals = {
+      billed: 0,
+      received: 0,
+      refunded: 0,
+      returns: 0,
+      chargesAdjusted: 0,
+      chargesGiven: 0,
+    };
     const isPayout = (c: Charge) =>
       c.settlement === "PAID_TO_PARTY" || c.settlement === "PAID_TO_OTHER";
     for (const inv of invoices) {
@@ -300,6 +311,7 @@ router.get(
         if (isPayout(c)) continue;
         const settled = r2c(Math.min(c.amount, budget));
         budget = r2c(budget - settled);
+        totals.chargesAdjusted += settled;
         const unsettled = r2c(c.amount - settled);
         const bits: string[] = [];
         if (c.note) bits.push(c.note);
@@ -336,13 +348,14 @@ router.get(
         if (!isPayout(c)) continue;
         const via = (c.method ?? "CASH").toUpperCase();
         if (c.settlement === "PAID_TO_PARTY") {
+          // Standard "Commission Allowed / Paid" treatment: the commission is
+          // allowed out of the bill value, then paid — two lines, net zero.
+          totals.chargesGiven += c.amount;
           entries.push({
             date: c.date,
-            kind: `${name(c)} earned`,
+            kind: `${name(c)} allowed`,
             ref: inv.invoiceNumber,
-            note: [c.note, "commission/charge due to this party on the bill"]
-              .filter(Boolean)
-              .join(" · "),
+            note: [c.note, "allowed out of the bill value"].filter(Boolean).join(" · "),
             debit: 0,
             credit: c.amount,
           });
@@ -350,7 +363,7 @@ router.get(
             date: c.date,
             kind: `${name(c)} paid (${via})`,
             ref: inv.invoiceNumber,
-            note: `handed over via ${via.toLowerCase()} — the bill itself is not reduced`,
+            note: `given to party via ${via.toLowerCase()}`,
             debit: c.amount,
             credit: 0,
           });
@@ -371,6 +384,13 @@ router.get(
         }
       }
     }
+    for (const inv of invoices) totals.billed += Number(inv.total);
+    for (const p of payments) {
+      if (p.direction === reduceDir) totals.received += Number(p.amount);
+      else totals.refunded += Number(p.amount);
+    }
+    for (const cn of creditNotes) totals.returns += Number(cn.totalAmount);
+
     entries.sort((a, b) => a.date.getTime() - b.date.getTime());
 
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
@@ -399,6 +419,14 @@ router.get(
         openingBalance: round2(Number(party.openingBalance)),
       },
       closingBalance: round2(balance),
+      totals: {
+        billed: round2(totals.billed),
+        received: round2(totals.received),
+        refunded: round2(totals.refunded),
+        returns: round2(totals.returns),
+        chargesAdjusted: round2(totals.chargesAdjusted),
+        chargesGiven: round2(totals.chargesGiven),
+      },
       ledger,
     });
   })
