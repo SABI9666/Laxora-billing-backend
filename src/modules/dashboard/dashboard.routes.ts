@@ -3,6 +3,7 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
+import { billDue, refundedByInvoice } from "../../lib/settlement";
 
 const router = Router();
 
@@ -48,12 +49,23 @@ router.get(
     const summaryCnMap = new Map(
       summaryCn.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
     );
+    const summaryRefunds = await refundedByInvoice(
+      prisma,
+      businessId,
+      receivableInvoices.map((i) => i.id),
+      "SALE"
+    );
     const totalReceivable = receivableInvoices.reduce(
       (s, i) =>
         s +
         Math.max(
           0,
-          Number(i.total) - Number(i.amountPaid) - (summaryCnMap.get(i.id) ?? 0)
+          billDue({
+            total: i.total,
+            amountPaid: i.amountPaid,
+            returned: summaryCnMap.get(i.id),
+            refunded: summaryRefunds.get(i.id),
+          })
         ),
       0
     );
@@ -343,15 +355,27 @@ router.get(
     const pendingCnMap = new Map(
       pendingCn.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
     );
+    const [recvRefunds, payRefunds] = await Promise.all([
+      refundedByInvoice(prisma, businessId, receivables.map((i) => i.id), "SALE"),
+      refundedByInvoice(prisma, businessId, payables.map((i) => i.id), "PURCHASE"),
+    ]);
     const due = (
       rows: { id: string; total: unknown; amountPaid: unknown }[],
-      cn?: Map<string | null, number>
+      cn: Map<string | null, number> | undefined,
+      refunds: Map<string, number>
     ) =>
       rows
-        .map((r) => Number(r.total) - Number(r.amountPaid) - (cn?.get(r.id) ?? 0))
+        .map((r) =>
+          billDue({
+            total: r.total as number,
+            amountPaid: r.amountPaid as number,
+            returned: cn?.get(r.id),
+            refunded: refunds.get(r.id),
+          })
+        )
         .filter((d) => d > 0.009);
-    const recv = due(receivables, pendingCnMap);
-    const pay = due(payables);
+    const recv = due(receivables, pendingCnMap, recvRefunds);
+    const pay = due(payables, undefined, payRefunds);
 
     res.json({
       overview: {

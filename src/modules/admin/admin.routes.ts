@@ -7,7 +7,8 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, conflict, notFound } from "../../utils/errors";
 import { hashPassword } from "../../utils/password";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
-import { reconcilePayments } from "../../lib/settlement";
+import { billDue, reconcilePayments, refundedByInvoice } from "../../lib/settlement";
+import { buildPartyLedger } from "../../lib/ledger";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
 
 // Cross-tenant, platform-owner endpoints. Mounted behind requirePlatformAdmin.
@@ -499,6 +500,7 @@ router.get(
         retnet: number;
         rettotal: number;
         retcogs: number;
+        refunded: number;
       }>
     >(Prisma.sql`
       SELECT inv.id AS id, inv."invoiceNumber" AS number, inv."invoiceDate" AS date,
@@ -511,7 +513,8 @@ router.get(
              COALESCE(e.exp, 0)::float AS expense,
              COALESCE(r.net, 0)::float AS retnet,
              COALESCE(r.total, 0)::float AS rettotal,
-             COALESCE(r.cogs, 0)::float AS retcogs
+             COALESCE(r.cogs, 0)::float AS retcogs,
+             COALESCE(rf.refunded, 0)::float AS refunded
       FROM "Invoice" inv
       LEFT JOIN LATERAL (
         SELECT SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)) AS cost
@@ -534,6 +537,12 @@ router.get(
         SELECT SUM("netAmount") AS net, SUM("totalAmount") AS total, SUM(cogs) AS cogs
         FROM "CreditNote" cn WHERE cn."invoiceId" = inv.id
       ) r ON true
+      LEFT JOIN LATERAL (
+        -- Money paid back on the bill (cash refunded on a return) is owed again.
+        SELECT COALESCE(SUM(amount), 0) AS refunded FROM "Payment" p
+        WHERE p."invoiceId" = inv.id
+          AND p.direction::text <> CASE WHEN inv.type::text = 'PURCHASE' THEN 'OUT' ELSE 'IN' END
+      ) rf ON true
       WHERE ${Prisma.join(conditions, " AND ")}
       ORDER BY inv."invoiceDate" DESC, inv."invoiceNumber" DESC
       LIMIT 100
@@ -570,7 +579,7 @@ router.get(
         const exp = round2(Number(b.expense));
         const due = Math.max(
           0,
-          Number(b.total) - Number(b.settled) - Number(b.rettotal)
+          Number(b.total) - Number(b.settled) - Number(b.rettotal) + Number(b.refunded)
         );
         return {
           id: b.id,
@@ -692,7 +701,19 @@ router.get(
         // Cash collected = customer payments only; amountPaid also folds in the
         // bill-linked charges that settle the due, so it drives outstanding.
         amountCollected: round2(cashCollected),
-        outstanding: round2(Math.max(0, total - Number(invoice.amountPaid) - returnTotal)),
+        outstanding: round2(
+          Math.max(
+            0,
+            billDue({
+              total,
+              amountPaid: invoice.amountPaid,
+              returned: returnTotal,
+              refunded: Number(
+                payAgg.find((g) => g.direction !== settleDir)?._sum.amount ?? 0
+              ),
+            })
+          )
+        ),
         returns: round2(returnTotal),
         cogs: round2(cogs),
         grossProfit: round2(grossProfit),
@@ -1521,9 +1542,18 @@ router.get(
     const cnMap = new Map(
       creditNotes.map((c) => [c.invoiceId, Number(c._sum.totalAmount ?? 0)])
     );
+    // A refund paid out on a bill (cash back on a return) is owed again.
+    const [recvRefunds, payRefunds] = await Promise.all([
+      refundedByInvoice(prisma, id, receivableInvoices.map((i) => i.id), "SALE"),
+      refundedByInvoice(prisma, id, payableInvoices.map((i) => i.id), "PURCHASE"),
+    ]);
     const bill = (inv: (typeof receivableInvoices)[number]) => {
-      const due =
-        Number(inv.total) - Number(inv.amountPaid) - (cnMap.get(inv.id) ?? 0);
+      const due = billDue({
+        total: inv.total,
+        amountPaid: inv.amountPaid,
+        returned: cnMap.get(inv.id),
+        refunded: (inv.type === "SALE" ? recvRefunds : payRefunds).get(inv.id),
+      });
       return {
         id: inv.id,
         number: inv.invoiceNumber,
@@ -1718,228 +1748,8 @@ router.get(
       },
     });
     if (!party) throw notFound("Party not found");
-    const invoiceType = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
 
-    const [invoices, payments, creditNotes] = await Promise.all([
-      prisma.invoice.findMany({
-        where: { partyId: party.id, type: invoiceType as never },
-        select: { id: true, invoiceNumber: true, invoiceDate: true, total: true, amountPaid: true },
-      }),
-      prisma.payment.findMany({
-        where: { partyId: party.id },
-        select: { paymentDate: true, amount: true, method: true, invoiceId: true, direction: true },
-      }),
-      // Returns (credit notes) reduce what the party owes.
-      prisma.creditNote.findMany({
-        where: { partyId: party.id },
-        select: { date: true, totalAmount: true, invoiceNumber: true },
-      }),
-    ]);
-
-    // Customer pays IN, supplier is paid OUT — that direction reduces what's
-    // owed; the opposite direction is a refund.
-    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
-
-    // Bill-linked charges (Commission, Transport, …) settle part of the bill,
-    // so they credit the party just like a payment — named by their category.
-    // Only the portion that actually cleared the bill is credited: amountPaid
-    // is capped at the bill total, so (amountPaid − payments on that bill) is
-    // the settling total, allocated across the bill's charges in date order.
-    const billCharges = invoices.length
-      ? await prisma.expense.findMany({
-          where: { invoiceId: { in: invoices.map((i) => i.id) } },
-          select: {
-            invoiceId: true,
-            date: true,
-            amount: true,
-            category: true,
-            note: true,
-            method: true,
-            settlement: true,
-          },
-        })
-      : [];
-    type Charge = {
-      date: Date;
-      amount: number;
-      category: string;
-      note: string | null;
-      method: string | null;
-      settlement: string | null;
-    };
-    const chargesByInv = new Map<string, Charge[]>();
-    for (const x of billCharges) {
-      const arr = chargesByInv.get(x.invoiceId!) ?? [];
-      arr.push({
-        date: x.date,
-        amount: Number(x.amount),
-        category: x.category,
-        note: x.note,
-        method: x.method,
-        settlement: x.settlement,
-      });
-      chargesByInv.set(x.invoiceId!, arr);
-    }
-    const linkedPaid = new Map<string, number>();
-    for (const p of payments)
-      if (p.invoiceId && p.direction === reduceDir)
-        linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
-
-    type Entry = {
-      date: Date;
-      kind: string;
-      ref: string;
-      // Free-text detail for the line (a charge's note and how it was settled).
-      note?: string;
-      debit: number;
-      credit: number;
-    };
-    const entries: Entry[] = [];
-    for (const inv of invoices) {
-      entries.push({
-        date: inv.invoiceDate,
-        kind: invoiceType === "SALE" ? "Sale Invoice" : "Purchase Invoice",
-        ref: inv.invoiceNumber,
-        debit: Number(inv.total),
-        credit: 0,
-      });
-    }
-    // Show which bill a linked voucher settled, so a lump sum split across
-    // several bills reads as such on the statement.
-    const billNo = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
-    for (const p of payments) {
-      const reduces = p.direction === reduceDir;
-      entries.push({
-        date: p.paymentDate,
-        kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
-        ref: (p.invoiceId && billNo.get(p.invoiceId)) || "",
-        debit: reduces ? 0 : Number(p.amount),
-        credit: reduces ? Number(p.amount) : 0,
-      });
-    }
-    for (const cn of creditNotes) {
-      entries.push({
-        date: cn.date,
-        kind: "Sales Return",
-        ref: cn.invoiceNumber ?? "",
-        debit: 0,
-        credit: Number(cn.totalAmount),
-      });
-    }
-    // Every bill-linked charge (commission, electrician, transport, …) gets its
-    // own line, named by its category and carrying its note, so the statement
-    // tells the whole story of that bill. The CREDIT is only the portion that
-    // actually cleared the bill: amountPaid is capped at the bill total, so
-    // (amountPaid − payments on that bill) is the settling budget, allocated
-    // across the bill's charges in date order. A charge on a bill the customer
-    // has already paid in full settles nothing — it is the shop's own cost —
-    // so it still appears, as a memo line with no amount in the columns and
-    // the explanation in the note. Previously such charges were dropped
-    // entirely, leaving no trace of, say, an electrician commission on the
-    // very statement where the accountant looks for it.
-    const inr = (n: number) =>
-      "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const r2c = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
-    const isPayout = (c: Charge) =>
-      c.settlement === "PAID_TO_PARTY" || c.settlement === "PAID_TO_OTHER";
-    for (const inv of invoices) {
-      const charges = chargesByInv.get(inv.id);
-      if (!charges) continue;
-      const name = (c: Charge) => (c.category === "Other" ? "Other charge" : c.category);
-      const sorted = [...charges].sort((a, b) => a.date.getTime() - b.date.getTime());
-
-      // Deductions share the bill's settling budget in date order.
-      let budget = Math.max(0, Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0));
-      for (const c of sorted) {
-        if (isPayout(c)) continue;
-        const settled = r2c(Math.min(c.amount, budget));
-        budget = r2c(budget - settled);
-        const unsettled = r2c(c.amount - settled);
-        const bits: string[] = [];
-        if (c.note) bits.push(c.note);
-        bits.push(
-          c.method
-            ? `paid out via ${c.method.toLowerCase()}`
-            : "adjusted against the bill, no cash paid"
-        );
-        if (unsettled > 0.009) {
-          bits.push(
-            settled > 0.009
-              ? `${inr(settled)} of ${inr(c.amount)} adjusted against the bill; the remaining ${inr(
-                  unsettled
-                )} is the shop's own cost as the bill was otherwise paid`
-              : `${inr(c.amount)} is the shop's own cost — the bill was already paid in full, so nothing was adjusted against it`
-          );
-        }
-        entries.push({
-          date: c.date,
-          kind: name(c),
-          ref: inv.invoiceNumber,
-          note: bits.join(" · "),
-          debit: 0,
-          credit: settled,
-        });
-      }
-
-      // Payouts never touch the bill's due. Money handed to the party itself
-      // (a commission given to the electrician) is shown as the amount they
-      // EARNED on the bill and, right after it, the amount PAID to them — a
-      // matched pair, both visible, netting to nothing owed. Money paid to a
-      // third party is the shop's cost and only a memo here.
-      for (const c of sorted) {
-        if (!isPayout(c)) continue;
-        const via = (c.method ?? "CASH").toUpperCase();
-        if (c.settlement === "PAID_TO_PARTY") {
-          entries.push({
-            date: c.date,
-            kind: `${name(c)} earned`,
-            ref: inv.invoiceNumber,
-            note: [c.note, "commission/charge due to this party on the bill"]
-              .filter(Boolean)
-              .join(" · "),
-            debit: 0,
-            credit: c.amount,
-          });
-          entries.push({
-            date: c.date,
-            kind: `${name(c)} paid (${via})`,
-            ref: inv.invoiceNumber,
-            note: `handed over via ${via.toLowerCase()} — the bill itself is not reduced`,
-            debit: c.amount,
-            credit: 0,
-          });
-        } else {
-          entries.push({
-            date: c.date,
-            kind: name(c),
-            ref: inv.invoiceNumber,
-            note: [
-              c.note,
-              `${inr(c.amount)} paid via ${via.toLowerCase()} to a third party — the shop's cost, not this party's account`,
-            ]
-              .filter(Boolean)
-              .join(" · "),
-            debit: 0,
-            credit: 0,
-          });
-        }
-      }
-    }
-    entries.sort((a, b) => a.date.getTime() - b.date.getTime());
-
-    let balance = Number(party.openingBalance);
-    const ledger = entries.map((e) => {
-      balance += e.debit - e.credit;
-      return {
-        date: e.date,
-        kind: e.kind,
-        ref: e.ref,
-        note: e.note ?? "",
-        debit: round2(e.debit),
-        credit: round2(e.credit),
-        balance: round2(balance),
-      };
-    });
+    const { ledger, totals, closingBalance } = await buildPartyLedger(prisma, party);
 
     res.json({
       party: {
@@ -1953,7 +1763,8 @@ router.get(
         shop: party.business.name,
       },
       business: party.business,
-      closingBalance: round2(balance),
+      closingBalance,
+      totals,
       ledger,
     });
   })

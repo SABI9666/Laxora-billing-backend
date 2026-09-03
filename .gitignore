@@ -5,3 +5,6 @@ dist/
 *.log
 .DS_Store
 coverage/
+
+# Next.js build output — this is an Express API; a stray `next build` here must never be committed.
+.next/

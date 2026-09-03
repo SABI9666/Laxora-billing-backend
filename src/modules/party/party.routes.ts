@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { z } from "zod";
 import { prisma } from "../../lib/prisma";
+import { buildPartyLedger } from "../../lib/ledger";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { notFound } from "../../utils/errors";
@@ -164,229 +165,9 @@ router.get(
       where: { id: req.params.id, businessId },
     });
     if (!party) throw notFound("Party not found");
-    const invoiceType = party.type === "CUSTOMER" ? "SALE" : "PURCHASE";
 
-    const [invoices, payments, creditNotes] = await Promise.all([
-      prisma.invoice.findMany({
-        where: { partyId: party.id, businessId, type: invoiceType as never },
-        select: { id: true, invoiceNumber: true, invoiceDate: true, total: true, amountPaid: true },
-      }),
-      prisma.payment.findMany({
-        where: { partyId: party.id, businessId },
-        select: { paymentDate: true, amount: true, method: true, invoiceId: true, direction: true },
-      }),
-      prisma.creditNote.findMany({
-        where: { partyId: party.id, businessId },
-        select: { date: true, totalAmount: true, invoiceNumber: true },
-      }),
-    ]);
-
-    // A payment in the party's usual direction (customer pays IN, we pay a
-    // supplier OUT) reduces what's owed; an opposite-direction payment is a
-    // refund (money going the other way).
-    const reduceDir = party.type === "CUSTOMER" ? "IN" : "OUT";
-
-    // Bill-linked charges (commission, damage, …) settle part of the bill, so
-    // they show as credits in the statement just like payments do — each named
-    // by its own category (Commission, Transport, …). We only credit the
-    // portion that actually cleared the bill: amountPaid is capped at the bill
-    // total, so (amountPaid − payments on that bill) is the total settling
-    // charges, never more than the outstanding. When several charges share a
-    // bill we allocate that budget across them in date order.
-    const billCharges = invoices.length
-      ? await prisma.expense.findMany({
-          where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
-          select: {
-            invoiceId: true,
-            date: true,
-            amount: true,
-            category: true,
-            note: true,
-            method: true,
-            settlement: true,
-          },
-        })
-      : [];
-    type Charge = {
-      date: Date;
-      amount: number;
-      category: string;
-      note: string | null;
-      method: string | null;
-      settlement: string | null;
-    };
-    const chargesByInv = new Map<string, Charge[]>();
-    for (const x of billCharges) {
-      const arr = chargesByInv.get(x.invoiceId!) ?? [];
-      arr.push({
-        date: x.date,
-        amount: Number(x.amount),
-        category: x.category,
-        note: x.note,
-        method: x.method,
-        settlement: x.settlement,
-      });
-      chargesByInv.set(x.invoiceId!, arr);
-    }
-    const linkedPaid = new Map<string, number>();
-    for (const p of payments)
-      if (p.invoiceId && p.direction === reduceDir)
-        linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
-
-    type Entry = {
-      date: Date;
-      kind: string;
-      ref: string;
-      // Free-text detail for the line (a charge's note and how it was settled).
-      note?: string;
-      debit: number;
-      credit: number;
-    };
-    const entries: Entry[] = [];
-    for (const inv of invoices)
-      entries.push({
-        date: inv.invoiceDate,
-        kind: invoiceType === "SALE" ? "Sale Invoice" : "Purchase Invoice",
-        ref: inv.invoiceNumber,
-        debit: Number(inv.total),
-        credit: 0,
-      });
-    // Show which bill a linked voucher settled, so a lump sum split across
-    // several bills reads as such on the statement.
-    const billNo = new Map(invoices.map((i) => [i.id, i.invoiceNumber]));
-    for (const p of payments) {
-      const reduces = p.direction === reduceDir;
-      entries.push({
-        date: p.paymentDate,
-        kind: reduces ? `Payment (${p.method})` : `Refund (${p.method})`,
-        ref: (p.invoiceId && billNo.get(p.invoiceId)) || "",
-        debit: reduces ? 0 : Number(p.amount),
-        credit: reduces ? Number(p.amount) : 0,
-      });
-    }
-    for (const cn of creditNotes)
-      entries.push({
-        date: cn.date,
-        kind: "Sales Return",
-        ref: cn.invoiceNumber ?? "",
-        debit: 0,
-        credit: Number(cn.totalAmount),
-      });
-    // Every bill-linked charge (commission, electrician, transport, …) gets its
-    // own line, named by its category and carrying its note, so the statement
-    // tells the whole story of that bill. The CREDIT is only the portion that
-    // actually cleared the bill: amountPaid is capped at the bill total, so
-    // (amountPaid − payments on that bill) is the settling budget, allocated
-    // across the bill's charges in date order. A charge on a bill the customer
-    // has already paid in full settles nothing — it is the shop's own cost —
-    // so it still appears, as a memo line with no amount in the columns and
-    // the explanation in the note. Previously such charges were dropped
-    // entirely, leaving no trace of, say, an electrician commission on the
-    // very statement where the accountant looks for it.
-    const inr = (n: number) =>
-      "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-    const r2c = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
-    const isPayout = (c: Charge) =>
-      c.settlement === "PAID_TO_PARTY" || c.settlement === "PAID_TO_OTHER";
-    for (const inv of invoices) {
-      const charges = chargesByInv.get(inv.id);
-      if (!charges) continue;
-      const name = (c: Charge) => (c.category === "Other" ? "Other charge" : c.category);
-      const sorted = [...charges].sort((a, b) => a.date.getTime() - b.date.getTime());
-
-      // Deductions share the bill's settling budget in date order.
-      let budget = Math.max(0, Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0));
-      for (const c of sorted) {
-        if (isPayout(c)) continue;
-        const settled = r2c(Math.min(c.amount, budget));
-        budget = r2c(budget - settled);
-        const unsettled = r2c(c.amount - settled);
-        const bits: string[] = [];
-        if (c.note) bits.push(c.note);
-        bits.push(
-          c.method
-            ? `paid out via ${c.method.toLowerCase()}`
-            : "adjusted against the bill, no cash paid"
-        );
-        if (unsettled > 0.009) {
-          bits.push(
-            settled > 0.009
-              ? `${inr(settled)} of ${inr(c.amount)} adjusted against the bill; the remaining ${inr(
-                  unsettled
-                )} is the shop's own cost as the bill was otherwise paid`
-              : `${inr(c.amount)} is the shop's own cost — the bill was already paid in full, so nothing was adjusted against it`
-          );
-        }
-        entries.push({
-          date: c.date,
-          kind: name(c),
-          ref: inv.invoiceNumber,
-          note: bits.join(" · "),
-          debit: 0,
-          credit: settled,
-        });
-      }
-
-      // Payouts never touch the bill's due. Money handed to the party itself
-      // (a commission given to the electrician) is shown as the amount they
-      // EARNED on the bill and, right after it, the amount PAID to them — a
-      // matched pair, both visible, netting to nothing owed. Money paid to a
-      // third party is the shop's cost and only a memo here.
-      for (const c of sorted) {
-        if (!isPayout(c)) continue;
-        const via = (c.method ?? "CASH").toUpperCase();
-        if (c.settlement === "PAID_TO_PARTY") {
-          entries.push({
-            date: c.date,
-            kind: `${name(c)} earned`,
-            ref: inv.invoiceNumber,
-            note: [c.note, "commission/charge due to this party on the bill"]
-              .filter(Boolean)
-              .join(" · "),
-            debit: 0,
-            credit: c.amount,
-          });
-          entries.push({
-            date: c.date,
-            kind: `${name(c)} paid (${via})`,
-            ref: inv.invoiceNumber,
-            note: `handed over via ${via.toLowerCase()} — the bill itself is not reduced`,
-            debit: c.amount,
-            credit: 0,
-          });
-        } else {
-          entries.push({
-            date: c.date,
-            kind: name(c),
-            ref: inv.invoiceNumber,
-            note: [
-              c.note,
-              `${inr(c.amount)} paid via ${via.toLowerCase()} to a third party — the shop's cost, not this party's account`,
-            ]
-              .filter(Boolean)
-              .join(" · "),
-            debit: 0,
-            credit: 0,
-          });
-        }
-      }
-    }
-    entries.sort((a, b) => a.date.getTime() - b.date.getTime());
-
+    const { ledger, totals, closingBalance } = await buildPartyLedger(prisma, party);
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
-    let balance = Number(party.openingBalance);
-    const ledger = entries.map((e) => {
-      balance += e.debit - e.credit;
-      return {
-        date: e.date,
-        kind: e.kind,
-        ref: e.ref,
-        note: e.note ?? "",
-        debit: round2(e.debit),
-        credit: round2(e.credit),
-        balance: round2(balance),
-      };
-    });
 
     res.json({
       party: {
@@ -398,7 +179,8 @@ router.get(
         billingAddress: party.billingAddress,
         openingBalance: round2(Number(party.openingBalance)),
       },
-      closingBalance: round2(balance),
+      closingBalance,
+      totals,
       ledger,
     });
   })

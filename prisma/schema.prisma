@@ -313,6 +313,11 @@ model InvoiceItem {
   rate        Decimal @default(0) @db.Decimal(14, 2)
   taxRate     Decimal @default(0) @db.Decimal(5, 2)
   amount      Decimal @default(0) @db.Decimal(14, 2)
+  // When the line was put on the bill. Lines added later ("+ Add" on a bill,
+  // or the replacement goods of an exchange) carry a later stamp than the
+  // bill itself, which lets the party ledger show them as their own dated
+  // entries instead of silently inflating the original invoice line.
+  createdAt   DateTime @default(now())
 
   @@index([invoiceId])
 }

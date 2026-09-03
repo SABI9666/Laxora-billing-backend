@@ -75,6 +75,69 @@ export async function recomputeAllLinkedInvoiceSettlements(db: Db) {
 }
 
 // ---------------------------------------------------------------------------
+// What a bill is still owed.
+//
+// amountPaid only counts money that settled the bill. Two other things move
+// the figure: goods RETURNED against it (a credit note) cut what is owed, and
+// a REFUND paid out on it (an opposite-direction voucher, e.g. cash handed
+// back on a return) gives that reduction back — the customer walked away with
+// money, so they owe it again. Every "pending" figure must apply both, or a
+// return that was refunded in cash shows the bill as nearly settled while the
+// party's statement (correctly) still shows the balance.
+// ---------------------------------------------------------------------------
+
+export function billDue(b: {
+  total: Prisma.Decimal | number | string;
+  amountPaid: Prisma.Decimal | number | string;
+  returned?: number;
+  refunded?: number;
+}): number {
+  return round2(
+    Number(b.total) - Number(b.amountPaid) - (b.returned ?? 0) + (b.refunded ?? 0)
+  );
+}
+
+// Credit-note value per bill.
+export async function returnedByInvoice(
+  db: Db,
+  businessId: string,
+  invoiceIds: string[]
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (!invoiceIds.length) return map;
+  const rows = await db.creditNote.groupBy({
+    by: ["invoiceId"],
+    where: { businessId, invoiceId: { in: invoiceIds } },
+    _sum: { totalAmount: true },
+  });
+  for (const r of rows) if (r.invoiceId) map.set(r.invoiceId, Number(r._sum.totalAmount ?? 0));
+  return map;
+}
+
+// Money paid back on each bill: vouchers running AGAINST the bill's settling
+// direction (OUT on a sale, IN on a purchase).
+export async function refundedByInvoice(
+  db: Db,
+  businessId: string,
+  invoiceIds: string[],
+  type: "SALE" | "PURCHASE"
+): Promise<Map<string, number>> {
+  const map = new Map<string, number>();
+  if (!invoiceIds.length) return map;
+  const rows = await db.payment.groupBy({
+    by: ["invoiceId"],
+    where: {
+      businessId,
+      invoiceId: { in: invoiceIds },
+      direction: type === "SALE" ? "OUT" : "IN",
+    },
+    _sum: { amount: true },
+  });
+  for (const r of rows) if (r.invoiceId) map.set(r.invoiceId, Number(r._sum.amount ?? 0));
+  return map;
+}
+
+// ---------------------------------------------------------------------------
 // Spreading a party's money across their bills.
 //
 // A bill's amountPaid only counts vouchers LINKED to that bill, while the
@@ -127,26 +190,25 @@ export async function settleAgainstOpenBills(
     orderBy: { invoiceDate: "asc" },
   });
 
-  // Goods returned against a sale already cut what the customer owes on it.
-  const returnedMap = new Map<string, number>();
-  if (open.length && type === "SALE") {
-    const cnRows = await tx.creditNote.groupBy({
-      by: ["invoiceId"],
-      where: { businessId: voucher.businessId, invoiceId: { in: open.map((i) => i.id) } },
-      _sum: { totalAmount: true },
-    });
-    for (const r of cnRows)
-      if (r.invoiceId) returnedMap.set(r.invoiceId, Number(r._sum.totalAmount ?? 0));
-  }
+  // Goods returned against a bill cut what is owed; a refund paid out on it
+  // gives that back.
+  const ids = open.map((i) => i.id);
+  const [returnedMap, refundedMap] = await Promise.all([
+    type === "SALE" ? returnedByInvoice(tx, voucher.businessId, ids) : new Map<string, number>(),
+    refundedByInvoice(tx, voucher.businessId, ids, type),
+  ]);
 
   let remaining = round2(amount);
   const linked: string[] = [];
   const paymentIds: string[] = [];
   for (const inv of open) {
     if (remaining <= 0.009) break;
-    const due = round2(
-      Number(inv.total) - Number(inv.amountPaid) - (returnedMap.get(inv.id) ?? 0)
-    );
+    const due = billDue({
+      total: inv.total,
+      amountPaid: inv.amountPaid,
+      returned: returnedMap.get(inv.id),
+      refunded: refundedMap.get(inv.id),
+    });
     if (due <= 0.009) continue;
     const part = round2(Math.min(remaining, due));
     const created = await tx.payment.create({
