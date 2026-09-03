@@ -11,6 +11,10 @@ const router = Router();
 const paymentSchema = z.object({
   partyId: z.string().optional(),
   invoiceId: z.string().optional(),
+  // Several bills settled by one voucher: the amount clears these oldest
+  // first; anything beyond them spills to the party's other open bills, and
+  // what is still left stays on the ledger as an advance.
+  invoiceIds: z.array(z.string().min(1)).optional(),
   // IN = credit voucher (money received), OUT = payment voucher (money given).
   direction: z.enum(["IN", "OUT"]).default("IN"),
   // Supplier Payment | Customer Receipt | Expense | Bank Deposit | Bank Withdrawal | Other
@@ -82,7 +86,22 @@ router.post(
     const linkedInvoice = body.invoiceId
       ? await prisma.invoice.findFirst({ where: { id: body.invoiceId, businessId } })
       : null;
-    const partyId = body.partyId ?? linkedInvoice?.partyId ?? null;
+
+    // Bills the accountant ticked. They must all exist here and belong to the
+    // same party, which then also stands in for a missing partyId.
+    const chosenIds = [...new Set((body.invoiceIds ?? []).filter(Boolean))];
+    const chosen = chosenIds.length
+      ? await prisma.invoice.findMany({
+          where: { id: { in: chosenIds }, businessId },
+          select: { id: true, partyId: true },
+        })
+      : [];
+    if (chosen.length !== chosenIds.length)
+      throw badRequest("One of the selected bills was not found for this business");
+
+    const partyId = body.partyId ?? linkedInvoice?.partyId ?? chosen[0]?.partyId ?? null;
+    if (chosen.some((c) => c.partyId !== partyId))
+      throw badRequest("The selected bills belong to different parties");
 
     const payment = await prisma.$transaction(async (tx) => {
       const common = {
@@ -95,6 +114,36 @@ router.post(
         notes: body.notes ?? null,
       };
       const settling = settlesSales || settlesPurchases;
+
+      // Accountant picked the bills: clear those oldest first, then let any
+      // excess run on to the party's other open bills, then keep the rest as
+      // an advance. Returns the first part created so the caller has a row.
+      if (chosenIds.length && settling && partyId && !body.invoiceId) {
+        const voucher = { ...common, partyId };
+        const picked = await settleAgainstOpenBills(tx, voucher, body.amount, {
+          onlyInvoiceIds: chosenIds,
+        });
+        let remaining = picked.remaining;
+        let firstId: string | undefined = picked.paymentIds[0];
+        if (remaining > 0.009) {
+          const spill = await settleAgainstOpenBills(tx, voucher, remaining, {
+            excludeInvoiceIds: chosenIds,
+          });
+          remaining = spill.remaining;
+          firstId = firstId ?? spill.paymentIds[0];
+        }
+        if (remaining > 0.009 || !firstId) {
+          const advance = await tx.payment.create({
+            data: {
+              ...common,
+              invoiceId: null,
+              amount: remaining > 0.009 ? remaining : body.amount,
+            },
+          });
+          firstId = firstId ?? advance.id;
+        }
+        return tx.payment.findUniqueOrThrow({ where: { id: firstId } });
+      }
 
       if (autoAllocate) {
         const { remaining, paymentIds } = await settleAgainstOpenBills(
@@ -160,7 +209,7 @@ router.post(
           tx,
           { ...common, partyId: partyId! },
           excess,
-          { excludeInvoiceId: linkedInvoice!.id }
+          { excludeInvoiceIds: [linkedInvoice!.id] }
         );
         if (remaining > 0.009) {
           const advance = await tx.payment.create({

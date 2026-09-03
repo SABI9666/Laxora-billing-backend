@@ -97,13 +97,15 @@ export type VoucherFields = {
 // placed because no open bill was left — the caller decides whether that
 // stays on the ledger as an advance.
 //
+// `onlyInvoiceIds` restricts the pass to bills the accountant picked;
+// `excludeInvoiceIds` keeps a follow-up pass off bills already handled.
 // `createdAt` lets a backfill keep the original entry timestamp on the parts
 // it creates, so the per-day "entries made" counts do not jump.
 export async function settleAgainstOpenBills(
   tx: Prisma.TransactionClient,
   voucher: VoucherFields,
   amount: number,
-  opts: { excludeInvoiceId?: string; createdAt?: Date } = {}
+  opts: { onlyInvoiceIds?: string[]; excludeInvoiceIds?: string[]; createdAt?: Date } = {}
 ): Promise<{ remaining: number; linked: string[]; paymentIds: string[] }> {
   const type = voucher.direction === "IN" ? "SALE" : "PURCHASE";
   const open = await tx.invoice.findMany({
@@ -112,7 +114,8 @@ export async function settleAgainstOpenBills(
       partyId: voucher.partyId,
       type,
       status: { in: ["UNPAID", "PARTIAL"] },
-      ...(opts.excludeInvoiceId ? { id: { not: opts.excludeInvoiceId } } : {}),
+      ...(opts.onlyInvoiceIds ? { id: { in: opts.onlyInvoiceIds } } : {}),
+      ...(opts.excludeInvoiceIds?.length ? { id: { notIn: opts.excludeInvoiceIds } } : {}),
     },
     orderBy: { invoiceDate: "asc" },
   });
