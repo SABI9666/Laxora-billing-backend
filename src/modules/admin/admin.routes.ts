@@ -27,9 +27,41 @@ function dateRange(req: { query: Record<string, unknown> }) {
 }
 
 // GET /api/admin/stats — platform-wide headline numbers.
+// With ?businessId=… the numbers are scoped to that one shop instead, so the
+// Overview page can follow the sidebar's selected shop.
 router.get(
   "/stats",
-  asyncHandler(async (_req, res) => {
+  asyncHandler(async (req, res) => {
+    const businessId = req.query.businessId ? String(req.query.businessId) : undefined;
+    if (businessId) {
+      const [business, invoices, parties, items, logins, salesAgg] =
+        await Promise.all([
+          prisma.business.findUnique({
+            where: { id: businessId },
+            select: { id: true, name: true, code: true },
+          }),
+          prisma.invoice.count({ where: { businessId } }),
+          prisma.party.count({ where: { businessId } }),
+          prisma.item.count({ where: { businessId } }),
+          prisma.membership.count({ where: { businessId } }),
+          prisma.invoice.aggregate({
+            where: { businessId, type: "SALE" },
+            _sum: { total: true },
+          }),
+        ]);
+      if (!business) throw notFound("Shop not found");
+      res.json({
+        shop: business,
+        stats: {
+          invoices,
+          parties,
+          items,
+          logins,
+          totalSalesVolume: Number(salesAgg._sum.total ?? 0),
+        },
+      });
+      return;
+    }
     const [users, businesses, franchises, invoices, parties, salesAgg] =
       await Promise.all([
         prisma.user.count(),
@@ -95,9 +127,19 @@ router.post(
       gstin: z.string().optional(),
       phone: z.string().optional(),
       address: z.string().optional(),
+      // Attach the new shop to a franchise so it immediately shows up as an
+      // external transfer target for the franchise's other shops.
+      franchiseId: z.string().optional(),
     })
   ),
   asyncHandler(async (req, res) => {
+    const { franchiseId } = req.body as { franchiseId?: string };
+    if (franchiseId) {
+      const franchise = await prisma.franchise.findUnique({
+        where: { id: franchiseId },
+      });
+      if (!franchise) throw notFound("Franchise not found");
+    }
     const business = await prisma.$transaction(async (tx) => {
       const created = await tx.business.create({
         data: { ...req.body, ownerId: req.auth!.userId },
@@ -108,6 +150,35 @@ router.post(
       return created;
     });
     res.status(201).json({ business });
+  })
+);
+
+// PATCH /api/admin/businesses/:id/franchise — attach an existing shop to a
+// franchise (or detach with franchiseId: null). External stock transfers are
+// only offered between shops of the SAME franchise, so a shop created without
+// a franchise never appears in the other shops' "Destination shop" list until
+// it is attached here.
+router.patch(
+  "/businesses/:id/franchise",
+  validateBody(z.object({ franchiseId: z.string().min(1).nullable() })),
+  asyncHandler(async (req, res) => {
+    const { franchiseId } = req.body as { franchiseId: string | null };
+    const business = await prisma.business.findUnique({
+      where: { id: req.params.id },
+    });
+    if (!business) throw notFound("Shop not found");
+    if (franchiseId) {
+      const franchise = await prisma.franchise.findUnique({
+        where: { id: franchiseId },
+      });
+      if (!franchise) throw notFound("Franchise not found");
+    }
+    const updated = await prisma.business.update({
+      where: { id: business.id },
+      data: { franchiseId },
+      include: { franchise: { select: { id: true, name: true } } },
+    });
+    res.json({ business: updated });
   })
 );
 
@@ -2085,21 +2156,24 @@ router.delete(
 
 // ---- Product edit approvals ------------------------------------------------
 
-// GET /api/admin/change-requests?status=PENDING — product edits awaiting review.
+// GET /api/admin/change-requests?status=PENDING&businessId=… — product edits
+// awaiting review, optionally scoped to one shop (sidebar-selected).
 // pendingCount includes invoice-deletion requests so the sidebar badge covers both.
 router.get(
   "/change-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
+    const businessId = req.query.businessId ? String(req.query.businessId) : undefined;
+    const scope = businessId ? { businessId } : {};
     const [requests, deletePending, returnDeletePending] = await Promise.all([
       prisma.itemChangeRequest.findMany({
-        where: { status },
+        where: { status, ...scope },
         include: { business: { select: { name: true } } },
         orderBy: { createdAt: "desc" },
         take: 200,
       }),
-      prisma.invoiceDeleteRequest.count({ where: { status: "PENDING" } }),
-      prisma.returnDeleteRequest.count({ where: { status: "PENDING" } }),
+      prisma.invoiceDeleteRequest.count({ where: { status: "PENDING", ...scope } }),
+      prisma.returnDeleteRequest.count({ where: { status: "PENDING", ...scope } }),
     ]);
     res.json({
       requests,
@@ -2110,13 +2184,14 @@ router.get(
 
 // ---- Invoice deletion approvals ---------------------------------------------
 
-// GET /api/admin/delete-requests?status=PENDING
+// GET /api/admin/delete-requests?status=PENDING&businessId=…
 router.get(
   "/delete-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
+    const businessId = req.query.businessId ? String(req.query.businessId) : undefined;
     const requests = await prisma.invoiceDeleteRequest.findMany({
-      where: { status },
+      where: { status, ...(businessId ? { businessId } : {}) },
       include: { business: { select: { name: true } } },
       orderBy: { createdAt: "desc" },
       take: 200,
@@ -2162,13 +2237,14 @@ router.post(
 
 // ---- Sales-return deletion approvals ----------------------------------------
 
-// GET /api/admin/return-delete-requests?status=PENDING
+// GET /api/admin/return-delete-requests?status=PENDING&businessId=…
 router.get(
   "/return-delete-requests",
   asyncHandler(async (req, res) => {
     const status = req.query.status ? String(req.query.status) : "PENDING";
+    const businessId = req.query.businessId ? String(req.query.businessId) : undefined;
     const requests = await prisma.returnDeleteRequest.findMany({
-      where: { status },
+      where: { status, ...(businessId ? { businessId } : {}) },
       include: { business: { select: { name: true } } },
       orderBy: { createdAt: "desc" },
       take: 200,

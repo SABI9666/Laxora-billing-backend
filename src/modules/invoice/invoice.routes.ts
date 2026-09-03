@@ -231,6 +231,7 @@ router.post(
           discount: body.discount,
           taxAmount,
           total,
+          taxInclusive: body.taxInclusive,
           notes: body.notes ?? null,
           estimateNo: body.estimateNo?.trim() || null,
           attachmentUrl: body.attachmentUrl ?? null,
@@ -294,7 +295,8 @@ router.post(
 const addItemsSchema = z.object({
   items: z.array(lineSchema).min(1),
   // When true, entered rates are GST-inclusive and the tax is split out.
-  taxInclusive: z.boolean().default(false),
+  // Omitted → falls back to the mode the bill was originally entered in.
+  taxInclusive: z.boolean().optional(),
 });
 
 // POST /api/invoices/:id/add-items — append newly purchased items to an
@@ -317,9 +319,11 @@ router.post(
     });
     if (!existing) throw notFound("Bill not found");
 
-    // Same ex-GST normalisation as invoice creation.
+    // Same ex-GST normalisation as invoice creation. Unless the caller says
+    // otherwise, new lines follow the mode the bill was entered in.
+    const taxInclusive = body.taxInclusive ?? existing.taxInclusive;
     const lines = body.items.map((l) => {
-      const netRate = round2(l.rate / (body.taxInclusive ? 1 + l.taxRate / 100 : 1));
+      const netRate = round2(l.rate / (taxInclusive ? 1 + l.taxRate / 100 : 1));
       const amount = round2(l.quantity * netRate);
       return { ...l, rate: netRate, amount };
     });
@@ -463,6 +467,7 @@ router.put(
           taxAmount,
           total,
           status,
+          taxInclusive: body.taxInclusive,
           notes: body.notes ?? null,
           estimateNo: body.estimateNo?.trim() || null,
           attachmentUrl: body.attachmentUrl ?? null,
