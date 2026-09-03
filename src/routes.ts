@@ -17,6 +17,7 @@ import reportRoutes from "./modules/report/report.routes";
 import franchiseRoutes from "./modules/franchise/franchise.routes";
 import onlineStoreRoutes from "./modules/integration/onlineStore.routes";
 import usageRoutes from "./modules/usage/usage.routes";
+import { shareRoutes, sharePublicRoutes } from "./modules/share/share.routes";
 
 const api = Router();
 
@@ -26,6 +27,9 @@ api.use("/auth", authRoutes);
 // Online store integration (e-commerce website): authenticated by a per-shop
 // API key (x-api-key header) instead of a user JWT.
 api.use("/online-store", onlineStoreRoutes);
+
+// Read-only bill / statement views opened from a share link (no login).
+api.use("/public/share", sharePublicRoutes);
 
 // Cross-tenant admin routes: require auth + platform-admin (no tenant scoping).
 api.use("/admin", authenticate, requirePlatformAdmin, adminRoutes);
@@ -46,5 +50,6 @@ api.use("/expenses", expenseRoutes);
 api.use("/dashboard", dashboardRoutes);
 api.use("/reports", reportRoutes);
 api.use("/usage", usageRoutes);
+api.use("/share", shareRoutes);
 
 export default api;
