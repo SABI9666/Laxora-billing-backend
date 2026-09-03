@@ -166,7 +166,7 @@ router.get(
     });
     if (!party) throw notFound("Party not found");
 
-    const { ledger, totals, closingBalance } = await buildPartyLedger(prisma, party);
+    const { ledger, totals, bills, closingBalance } = await buildPartyLedger(prisma, party);
     const round2 = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
 
     res.json({
@@ -181,6 +181,7 @@ router.get(
       },
       closingBalance,
       totals,
+      bills,
       ledger,
     });
   })
