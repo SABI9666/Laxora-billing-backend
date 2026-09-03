@@ -7,7 +7,11 @@ import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
 import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
-import { applyPartyAdvances, recomputeInvoiceSettlement } from "../../lib/settlement";
+import {
+  applyPartyAdvances,
+  recomputeInvoiceSettlement,
+  refundedByInvoice,
+} from "../../lib/settlement";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 
 const router = Router();
@@ -78,6 +82,19 @@ router.get(
       for (const r of cnRows)
         if (r.invoiceId) returnedMap.set(r.invoiceId, Number(r._sum.totalAmount ?? 0));
     }
+    // Money paid back on each bill (cash refunded on a return) is owed again,
+    // so the pending figure has to add it back — same as the dashboard and
+    // the admin reports.
+    const [saleRefunds, purchaseRefunds] = await Promise.all([
+      refundedByInvoice(prisma, req.businessId!, saleIds, "SALE"),
+      refundedByInvoice(
+        prisma,
+        req.businessId!,
+        invoices.filter((i) => i.type === "PURCHASE").map((i) => i.id),
+        "PURCHASE"
+      ),
+    ]);
+
     // Profit is a nice-to-have: never let a problem computing it (bad data,
     // a divide-by-zero tax rate, etc.) crash the whole invoice list.
     if (saleIds.length) {
@@ -141,6 +158,9 @@ router.get(
         ...inv,
         profit: profitMap.get(inv.id) ?? null,
         returnedAmount: round2(returnedMap.get(inv.id) ?? 0),
+        refundedAmount: round2(
+          (inv.type === "SALE" ? saleRefunds : purchaseRefunds).get(inv.id) ?? 0
+        ),
       })),
     });
   })
@@ -168,8 +188,16 @@ router.get(
       _sum: { totalAmount: true },
     });
 
+    const refunded = (
+      await refundedByInvoice(prisma, req.businessId!, [invoice.id], invoice.type)
+    ).get(invoice.id);
+
     res.json({
-      invoice: { ...invoice, returnedAmount: round2(Number(cn._sum.totalAmount ?? 0)) },
+      invoice: {
+        ...invoice,
+        returnedAmount: round2(Number(cn._sum.totalAmount ?? 0)),
+        refundedAmount: round2(refunded ?? 0),
+      },
     });
   })
 );

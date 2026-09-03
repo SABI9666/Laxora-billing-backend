@@ -4,7 +4,12 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, notFound } from "../../utils/errors";
-import { recomputeInvoiceSettlement, settleAgainstOpenBills } from "../../lib/settlement";
+import {
+  billDue,
+  recomputeInvoiceSettlement,
+  refundedByInvoice,
+  settleAgainstOpenBills,
+} from "../../lib/settlement";
 
 const router = Router();
 
@@ -182,11 +187,17 @@ router.post(
                 )._sum.totalAmount ?? 0
               )
             : 0;
+        const refunded = (
+          await refundedByInvoice(tx, businessId, [linkedInvoice.id], linkedInvoice.type)
+        ).get(linkedInvoice.id);
         const due = Math.max(
           0,
-          Math.round(
-            (Number(linkedInvoice.total) - Number(linkedInvoice.amountPaid) - returned) * 100
-          ) / 100
+          billDue({
+            total: linkedInvoice.total,
+            amountPaid: linkedInvoice.amountPaid,
+            returned,
+            refunded,
+          })
         );
         if (body.amount > due + 0.009) {
           amountHere = due;
