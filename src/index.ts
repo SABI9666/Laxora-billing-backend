@@ -2,12 +2,17 @@ import { createApp } from "./app";
 import { env } from "./config/env";
 import { prisma } from "./lib/prisma";
 import { recomputeAllLinkedInvoiceSettlements, reconcilePayments } from "./lib/settlement";
+import { ensureSchema } from "./lib/schema-guard";
 
 const app = createApp();
 
 // Cloud Run injects PORT; bind to 0.0.0.0 so the container is reachable.
-const server = app.listen(env.port, "0.0.0.0", () => {
+const server = app.listen(env.port, "0.0.0.0", async () => {
   console.log(`Laxora billing API listening on port ${env.port} (${env.nodeEnv})`);
+
+  // Columns the code relies on that may not have been added to the database
+  // by hand yet. Runs first so the backfills below see the full schema.
+  await ensureSchema(prisma);
 
   // Bill-linked charges count toward a bill's settled amount; bills whose
   // charges predate that rule still show the old due/status. Idempotent, so
