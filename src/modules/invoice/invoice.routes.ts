@@ -192,11 +192,68 @@ router.get(
       await refundedByInvoice(prisma, req.businessId!, [invoice.id], invoice.type)
     ).get(invoice.id);
 
+    // Every return / exchange on this bill with its goods named, so the
+    // printed bill can show what came back and what replaced it.
+    type RetLine = {
+      invoiceItemId?: string;
+      itemId?: string | null;
+      quantity?: number;
+      rate?: number;
+      taxRate?: number;
+    };
+    const asLines = (v: unknown): RetLine[] => (Array.isArray(v) ? (v as RetLine[]) : []);
+    const notes = await prisma.creditNote.findMany({
+      where: { businessId: req.businessId!, invoiceId: invoice.id },
+      orderBy: { date: "asc" },
+    });
+    const lineById = new Map(invoice.items.map((it) => [it.id, it]));
+    const wantNames = new Set<string>();
+    for (const n of notes)
+      for (const l of asLines(n.lines))
+        if (!(l.invoiceItemId && lineById.has(l.invoiceItemId)) && l.itemId) wantNames.add(l.itemId);
+    const named = wantNames.size
+      ? await prisma.item.findMany({
+          where: { id: { in: [...wantNames] } },
+          select: { id: true, name: true },
+        })
+      : [];
+    const itemName = new Map(named.map((n) => [n.id, n.name]));
+    const returns = notes.map((n) => ({
+      id: n.id,
+      date: n.date,
+      reason: n.reason,
+      refundMethod: n.refundMethod,
+      netAmount: Number(n.netAmount),
+      taxAmount: Number(n.taxAmount),
+      totalAmount: Number(n.totalAmount),
+      lines: asLines(n.lines).map((l) => {
+        const qty = Number(l.quantity ?? 0);
+        const rate = Number(l.rate ?? 0);
+        const taxRate = Number(l.taxRate ?? 0);
+        return {
+          description:
+            (l.invoiceItemId && lineById.get(l.invoiceItemId)?.description) ||
+            (l.itemId && itemName.get(l.itemId)) ||
+            "Returned goods",
+          quantity: qty,
+          rate,
+          taxRate,
+          amount: round2(qty * rate),
+          total: round2(qty * rate * (1 + taxRate / 100)),
+        };
+      }),
+      // Bill lines put on by this exchange (marked on the printed bill).
+      exchangeItemIds: asLines(n.exchangeLines)
+        .map((l) => l.invoiceItemId)
+        .filter((x): x is string => !!x),
+    }));
+
     res.json({
       invoice: {
         ...invoice,
         returnedAmount: round2(Number(cn._sum.totalAmount ?? 0)),
         refundedAmount: round2(refunded ?? 0),
+        returns,
       },
     });
   })
