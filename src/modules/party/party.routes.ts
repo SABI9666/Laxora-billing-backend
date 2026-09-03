@@ -196,13 +196,33 @@ router.get(
     const billCharges = invoices.length
       ? await prisma.expense.findMany({
           where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
-          select: { invoiceId: true, date: true, amount: true, category: true },
+          select: {
+            invoiceId: true,
+            date: true,
+            amount: true,
+            category: true,
+            note: true,
+            method: true,
+          },
         })
       : [];
-    const chargesByInv = new Map<string, { date: Date; amount: number; category: string }[]>();
+    type Charge = {
+      date: Date;
+      amount: number;
+      category: string;
+      note: string | null;
+      method: string | null;
+    };
+    const chargesByInv = new Map<string, Charge[]>();
     for (const x of billCharges) {
       const arr = chargesByInv.get(x.invoiceId!) ?? [];
-      arr.push({ date: x.date, amount: Number(x.amount), category: x.category });
+      arr.push({
+        date: x.date,
+        amount: Number(x.amount),
+        category: x.category,
+        note: x.note,
+        method: x.method,
+      });
       chargesByInv.set(x.invoiceId!, arr);
     }
     const linkedPaid = new Map<string, number>();
@@ -210,7 +230,15 @@ router.get(
       if (p.invoiceId && p.direction === reduceDir)
         linkedPaid.set(p.invoiceId, (linkedPaid.get(p.invoiceId) ?? 0) + Number(p.amount));
 
-    type Entry = { date: Date; kind: string; ref: string; debit: number; credit: number };
+    type Entry = {
+      date: Date;
+      kind: string;
+      ref: string;
+      // Free-text detail for the line (a charge's note and how it was settled).
+      note?: string;
+      debit: number;
+      credit: number;
+    };
     const entries: Entry[] = [];
     for (const inv of invoices)
       entries.push({
@@ -241,22 +269,50 @@ router.get(
         debit: 0,
         credit: Number(cn.totalAmount),
       });
+    // Every bill-linked charge (commission, electrician, transport, …) gets its
+    // own line, named by its category and carrying its note, so the statement
+    // tells the whole story of that bill. The CREDIT is only the portion that
+    // actually cleared the bill: amountPaid is capped at the bill total, so
+    // (amountPaid − payments on that bill) is the settling budget, allocated
+    // across the bill's charges in date order. A charge on a bill the customer
+    // has already paid in full settles nothing — it is the shop's own cost —
+    // so it still appears, as a memo line with no amount in the columns and
+    // the explanation in the note. Previously such charges were dropped
+    // entirely, leaving no trace of, say, an electrician commission on the
+    // very statement where the accountant looks for it.
+    const inr = (n: number) =>
+      "₹" + n.toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const r2c = (n: number) => Math.round((n + Number.EPSILON) * 100) / 100;
     for (const inv of invoices) {
       const charges = chargesByInv.get(inv.id);
-      if (!charges) continue; // no linked charges on this bill
-      // Total that actually cleared this bill (capped at its outstanding).
-      let budget = Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0);
-      if (budget <= 0) continue;
+      if (!charges) continue;
+      let budget = Math.max(0, Number(inv.amountPaid) - (linkedPaid.get(inv.id) ?? 0));
       for (const c of [...charges].sort((a, b) => a.date.getTime() - b.date.getTime())) {
-        if (budget <= 0) break;
-        const credit = Math.min(c.amount, budget);
-        budget -= credit;
+        const settled = r2c(Math.min(c.amount, budget));
+        budget = r2c(budget - settled);
+        const unsettled = r2c(c.amount - settled);
+        const how = c.method
+          ? `paid out via ${c.method.toLowerCase()}`
+          : "adjusted against the bill, no cash paid";
+        const bits: string[] = [];
+        if (c.note) bits.push(c.note);
+        bits.push(how);
+        if (unsettled > 0.009) {
+          bits.push(
+            settled > 0.009
+              ? `${inr(settled)} of ${inr(c.amount)} adjusted against the bill; the remaining ${inr(
+                  unsettled
+                )} is the shop's own cost as the bill was otherwise paid`
+              : `${inr(c.amount)} is the shop's own cost — the bill was already paid in full, so nothing was adjusted against it`
+          );
+        }
         entries.push({
           date: c.date,
-          kind: `Bill Charge (${c.category})`,
+          kind: c.category === "Other" ? "Other charge" : c.category,
           ref: inv.invoiceNumber,
+          note: bits.join(" · "),
           debit: 0,
-          credit,
+          credit: settled,
         });
       }
     }
@@ -270,6 +326,7 @@ router.get(
         date: e.date,
         kind: e.kind,
         ref: e.ref,
+        note: e.note ?? "",
         debit: round2(e.debit),
         credit: round2(e.credit),
         balance: round2(balance),
