@@ -1025,6 +1025,52 @@ router.get(
   })
 );
 
+// DELETE /api/invoices/:id/return/:creditNoteId/refund — the return stays, but
+// the cash/bank refund recorded with it is removed.
+//
+// Choosing a refund method on a return means "we handed the money back", so
+// the returned value comes off the bill AND the money paid out is owed again —
+// the two cancel out and the bill's due is unchanged. That is right when cash
+// really left the drawer, but a return on a bill the customer still owes for is
+// almost always an adjustment, not a payout. This turns such a return into a
+// plain ledger credit: the due drops by the returned value and the cash book
+// no longer shows money going out.
+router.delete(
+  "/:id/return/:creditNoteId/refund",
+  requireRole(...BILLING_ROLES),
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const note = await prisma.creditNote.findFirst({
+      where: { id: req.params.creditNoteId, businessId, invoiceId: req.params.id },
+    });
+    if (!note) throw notFound("Return entry not found");
+    if (!note.refundPaymentId && !note.refundMethod)
+      throw badRequest("This return was already adjusted against the bill — no refund to remove.");
+
+    const removed = await prisma.$transaction(async (tx) => {
+      let amount = 0;
+      if (note.refundPaymentId) {
+        const pay = await tx.payment.findFirst({
+          where: { id: note.refundPaymentId, businessId },
+        });
+        if (pay) {
+          amount = Number(pay.amount);
+          await tx.payment.delete({ where: { id: pay.id } });
+        }
+      }
+      await tx.creditNote.update({
+        where: { id: note.id },
+        data: { refundMethod: null, refundPaymentId: null },
+      });
+      // The bill's receipts changed, so re-derive amountPaid and status.
+      await recomputeInvoiceSettlement(tx, req.params.id);
+      return amount;
+    });
+
+    res.json({ ok: true, removedRefund: round2(removed) });
+  })
+);
+
 // DELETE /api/invoices/:id/return/:creditNoteId — undo a wrong return.
 // Platform admins reverse it immediately; shop users' undo is held for
 // platform-admin approval (mirrors invoice deletion). On approval the return is
