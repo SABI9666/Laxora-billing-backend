@@ -399,143 +399,200 @@ router.get(
   })
 );
 
-// GET /api/dashboard/monthly-trend?months=12 — one row per calendar month with
-// sales, purchases and profit, for the dashboard's trend chart. Months are
-// bucketed in Indian time (IST, UTC+5:30) and the window always ends with the
-// current month. Profit is built exactly like /overview's: ex-GST net revenue
-// plus standalone service income, less de-grossed COGS and expenses, with
-// sales returns reversing both the revenue and the cost of the goods sent back.
-router.get(
-  "/monthly-trend",
-  asyncHandler(async (req, res) => {
-    const businessId = req.businessId!;
-    const IST_MS = 5.5 * 60 * 60 * 1000;
-    const asked = Number(req.query.months);
-    const months = Number.isFinite(asked) ? Math.min(24, Math.max(3, Math.trunc(asked))) : 12;
+// GET /api/dashboard/trend?bucket=month|week&periods=12 — one row per period
+// with sales, purchases and profit, for the dashboard's trend chart. Periods
+// are bucketed in Indian time (IST, UTC+5:30): calendar months, or Monday-start
+// weeks, always ending with the one we are in now. Profit is built exactly like
+// /overview's: ex-GST net revenue plus standalone service income, less
+// de-grossed COGS and expenses, with sales returns reversing both the revenue
+// and the cost of the goods sent back.
+//
+// Also mounted at the older /monthly-trend path so a frontend deployed before
+// weekly existed keeps working (it sends no bucket, and month is the default).
+const trendHandler = asyncHandler(async (req, res) => {
+  const businessId = req.businessId!;
+  const IST_MS = 5.5 * 60 * 60 * 1000;
+  const bucket = req.query.bucket === "week" ? "week" : "month";
 
-    const ist = new Date(Date.now() + IST_MS);
-    const y = ist.getUTCFullYear();
-    const m = ist.getUTCMonth();
-    // IST midnight on the 1st of a month, as a UTC instant.
-    const monthStart = (yy: number, mm: number) => new Date(Date.UTC(yy, mm, 1) - IST_MS);
-    const from = monthStart(y, m - (months - 1));
-    const to = monthStart(y, m + 1); // exclusive
+  // `months` is the parameter the first version of this endpoint took; keep
+  // honouring it so the older frontend's ?months=6 still narrows the window.
+  const askedPeriods = Number(req.query.periods ?? req.query.months);
+  const limits = bucket === "week" ? { min: 4, max: 53, fallback: 12 } : { min: 3, max: 24, fallback: 12 };
+  const periods = Number.isFinite(askedPeriods)
+    ? Math.min(limits.max, Math.max(limits.min, Math.trunc(askedPeriods)))
+    : limits.fallback;
 
-    // One grouped query per source instead of a per-month round trip — twelve
-    // months cost five queries, not sixty.
-    const [invoiceRows, cogsRows, expenseRows, incomeRows, returnRows] = await Promise.all([
-      prisma.$queryRaw<
-        Array<{
-          ym: string;
-          sales: number;
-          purchases: number;
-          grossRevenue: number;
-          saleBills: number;
-          purchaseBills: number;
-        }>
-      >(Prisma.sql`
-        SELECT to_char("invoiceDate" + interval '330 minutes', 'YYYY-MM') AS ym,
-               COALESCE(SUM(CASE WHEN type = 'SALE' THEN total END), 0)::float AS sales,
-               COALESCE(SUM(CASE WHEN type = 'PURCHASE' THEN total END), 0)::float AS purchases,
-               COALESCE(SUM(CASE WHEN type = 'SALE' THEN subtotal - discount END), 0)::float
-                 AS "grossRevenue",
-               COUNT(*) FILTER (WHERE type = 'SALE')::int AS "saleBills",
-               COUNT(*) FILTER (WHERE type = 'PURCHASE')::int AS "purchaseBills"
-        FROM "Invoice"
-        WHERE "businessId" = ${businessId}
-          AND "invoiceDate" >= ${from}
-          AND "invoiceDate" < ${to}
-        GROUP BY 1
-      `),
-      prisma.$queryRaw<Array<{ ym: string; cogs: number }>>(Prisma.sql`
-        SELECT to_char(inv."invoiceDate" + interval '330 minutes', 'YYYY-MM') AS ym,
-               COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float
-                 AS cogs
-        FROM "InvoiceItem" ii
-        JOIN "Invoice" inv ON inv.id = ii."invoiceId"
-        JOIN "Item" i ON i.id = ii."itemId"
-        WHERE inv."businessId" = ${businessId}
-          AND inv.type = 'SALE'
-          AND inv."invoiceDate" >= ${from}
-          AND inv."invoiceDate" < ${to}
-        GROUP BY 1
-      `),
-      prisma.$queryRaw<Array<{ ym: string; expenses: number }>>(Prisma.sql`
-        SELECT to_char("date" + interval '330 minutes', 'YYYY-MM') AS ym,
-               COALESCE(SUM(amount), 0)::float AS expenses
-        FROM "Expense"
-        WHERE "businessId" = ${businessId}
-          AND "date" >= ${from}
-          AND "date" < ${to}
-        GROUP BY 1
-      `),
-      prisma.$queryRaw<Array<{ ym: string; income: number }>>(Prisma.sql`
-        SELECT to_char("paymentDate" + interval '330 minutes', 'YYYY-MM') AS ym,
-               COALESCE(SUM(amount), 0)::float AS income
-        FROM "Payment"
-        WHERE "businessId" = ${businessId}
-          AND direction = 'IN'
-          AND purpose IN (${Prisma.join(INCOME_PURPOSE_LIST)})
-          AND "paymentDate" >= ${from}
-          AND "paymentDate" < ${to}
-        GROUP BY 1
-      `),
-      prisma.$queryRaw<Array<{ ym: string; retNet: number; retCogs: number }>>(Prisma.sql`
-        SELECT to_char("date" + interval '330 minutes', 'YYYY-MM') AS ym,
-               COALESCE(SUM("netAmount"), 0)::float AS "retNet",
-               COALESCE(SUM(cogs), 0)::float AS "retCogs"
-        FROM "CreditNote"
-        WHERE "businessId" = ${businessId}
-          AND "date" >= ${from}
-          AND "date" < ${to}
-        GROUP BY 1
-      `),
-    ]);
+  const ist = new Date(Date.now() + IST_MS);
+  const y = ist.getUTCFullYear();
+  const m = ist.getUTCMonth();
+  const d = ist.getUTCDate();
+  // Monday = 0, so a week runs Mon–Sun like the shop's own week.
+  const weekdayOffset = (ist.getUTCDay() + 6) % 7;
 
-    const byMonth = <T>(rows: Array<T & { ym: string }>) => new Map(rows.map((r) => [r.ym, r]));
-    const inv = byMonth(invoiceRows);
-    const cog = byMonth(cogsRows);
-    const exp = byMonth(expenseRows);
-    const inc = byMonth(incomeRows);
-    const ret = byMonth(returnRows);
+  // IST midnight, as the UTC instant the database stores.
+  const istMidnight = (yy: number, mm: number, dd: number) =>
+    new Date(Date.UTC(yy, mm, dd) - IST_MS);
+  // Start of the period `i` steps from the current one (negative = earlier).
+  const periodStart = (i: number) =>
+    bucket === "week"
+      ? istMidnight(y, m, d - weekdayOffset + i * 7)
+      : istMidnight(y, m + i, 1);
 
-    const MONTH = [
-      "Jan", "Feb", "Mar", "Apr", "May", "Jun",
-      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
+  const from = periodStart(-(periods - 1));
+  const to = periodStart(1); // exclusive
 
-    const trend = [];
-    for (let i = months - 1; i >= 0; i--) {
-      const d = new Date(Date.UTC(y, m - i, 1));
-      const yy = d.getUTCFullYear();
-      const mm = d.getUTCMonth();
-      const ym = `${yy}-${String(mm + 1).padStart(2, "0")}`;
+  // The key both sides agree on: a month is "YYYY-MM", a week is the IST date
+  // of its Monday. date_trunc('week') is Monday-based, which is why the
+  // JavaScript side counts weekdays from Monday too.
+  const keyOf = (col: string) => {
+    const c = Prisma.raw(col);
+    return bucket === "week"
+      ? Prisma.sql`to_char(date_trunc('week', ${c} + interval '330 minutes'), 'YYYY-MM-DD')`
+      : Prisma.sql`to_char(${c} + interval '330 minutes', 'YYYY-MM')`;
+  };
 
-      const iv = inv.get(ym);
-      const netRevenue = Number(iv?.grossRevenue ?? 0) - Number(ret.get(ym)?.retNet ?? 0);
-      const cogs = Number(cog.get(ym)?.cogs ?? 0) - Number(ret.get(ym)?.retCogs ?? 0);
-      const expenses = Number(exp.get(ym)?.expenses ?? 0);
-      const serviceIncome = Number(inc.get(ym)?.income ?? 0);
+  // One grouped query per source instead of a per-period round trip — twelve
+  // periods cost five queries, not sixty.
+  const [invoiceRows, cogsRows, expenseRows, incomeRows, returnRows] = await Promise.all([
+    prisma.$queryRaw<
+      Array<{
+        key: string;
+        sales: number;
+        purchases: number;
+        grossRevenue: number;
+        saleBills: number;
+        purchaseBills: number;
+      }>
+    >(Prisma.sql`
+      SELECT ${keyOf('"invoiceDate"')} AS key,
+             COALESCE(SUM(CASE WHEN type = 'SALE' THEN total END), 0)::float AS sales,
+             COALESCE(SUM(CASE WHEN type = 'PURCHASE' THEN total END), 0)::float AS purchases,
+             COALESCE(SUM(CASE WHEN type = 'SALE' THEN subtotal - discount END), 0)::float
+               AS "grossRevenue",
+             COUNT(*) FILTER (WHERE type = 'SALE')::int AS "saleBills",
+             COUNT(*) FILTER (WHERE type = 'PURCHASE')::int AS "purchaseBills"
+      FROM "Invoice"
+      WHERE "businessId" = ${businessId}
+        AND "invoiceDate" >= ${from}
+        AND "invoiceDate" < ${to}
+      GROUP BY 1
+    `),
+    prisma.$queryRaw<Array<{ key: string; cogs: number }>>(Prisma.sql`
+      SELECT ${keyOf('inv."invoiceDate"')} AS key,
+             COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float
+               AS cogs
+      FROM "InvoiceItem" ii
+      JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+      JOIN "Item" i ON i.id = ii."itemId"
+      WHERE inv."businessId" = ${businessId}
+        AND inv.type = 'SALE'
+        AND inv."invoiceDate" >= ${from}
+        AND inv."invoiceDate" < ${to}
+      GROUP BY 1
+    `),
+    prisma.$queryRaw<Array<{ key: string; expenses: number }>>(Prisma.sql`
+      SELECT ${keyOf('"date"')} AS key,
+             COALESCE(SUM(amount), 0)::float AS expenses
+      FROM "Expense"
+      WHERE "businessId" = ${businessId}
+        AND "date" >= ${from}
+        AND "date" < ${to}
+      GROUP BY 1
+    `),
+    prisma.$queryRaw<Array<{ key: string; income: number }>>(Prisma.sql`
+      SELECT ${keyOf('"paymentDate"')} AS key,
+             COALESCE(SUM(amount), 0)::float AS income
+      FROM "Payment"
+      WHERE "businessId" = ${businessId}
+        AND direction = 'IN'
+        AND purpose IN (${Prisma.join(INCOME_PURPOSE_LIST)})
+        AND "paymentDate" >= ${from}
+        AND "paymentDate" < ${to}
+      GROUP BY 1
+    `),
+    prisma.$queryRaw<Array<{ key: string; retNet: number; retCogs: number }>>(Prisma.sql`
+      SELECT ${keyOf('"date"')} AS key,
+             COALESCE(SUM("netAmount"), 0)::float AS "retNet",
+             COALESCE(SUM(cogs), 0)::float AS "retCogs"
+      FROM "CreditNote"
+      WHERE "businessId" = ${businessId}
+        AND "date" >= ${from}
+        AND "date" < ${to}
+      GROUP BY 1
+    `),
+  ]);
 
-      trend.push({
-        month: ym,
-        label: MONTH[mm],
-        fullLabel: `${MONTH[mm]} ${yy}`,
-        sales: round2(Number(iv?.sales ?? 0)),
-        purchases: round2(Number(iv?.purchases ?? 0)),
-        netRevenue: round2(netRevenue),
-        serviceIncome: round2(serviceIncome),
-        cogs: round2(cogs),
-        expenses: round2(expenses),
-        profit: round2(netRevenue + serviceIncome - cogs - expenses),
-        saleBills: Number(iv?.saleBills ?? 0),
-        purchaseBills: Number(iv?.purchaseBills ?? 0),
-      });
+  const byKey = <T>(rows: Array<T & { key: string }>) => new Map(rows.map((r) => [r.key, r]));
+  const inv = byKey(invoiceRows);
+  const cog = byKey(cogsRows);
+  const exp = byKey(expenseRows);
+  const inc = byKey(incomeRows);
+  const ret = byKey(returnRows);
+
+  const MONTH = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+    "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+  ];
+
+  const trend = [];
+  for (let i = periods - 1; i >= 0; i--) {
+    // The IST calendar date this period starts on.
+    const startIst = new Date(periodStart(-i).getTime() + IST_MS);
+    const sy = startIst.getUTCFullYear();
+    const sm = startIst.getUTCMonth();
+    const sd = startIst.getUTCDate();
+
+    let key: string;
+    let label: string;
+    let fullLabel: string;
+    if (bucket === "week") {
+      key = `${sy}-${String(sm + 1).padStart(2, "0")}-${String(sd).padStart(2, "0")}`;
+      label = `${sd} ${MONTH[sm]}`;
+      // The Sunday that closes the week.
+      const end = new Date(Date.UTC(sy, sm, sd + 6));
+      const ey = end.getUTCFullYear();
+      const em = end.getUTCMonth();
+      const ed = end.getUTCDate();
+      fullLabel =
+        sm === em && sy === ey
+          ? `${sd}–${ed} ${MONTH[sm]} ${sy}`
+          : `${sd} ${MONTH[sm]} – ${ed} ${MONTH[em]} ${ey}`;
+    } else {
+      key = `${sy}-${String(sm + 1).padStart(2, "0")}`;
+      label = MONTH[sm];
+      fullLabel = `${MONTH[sm]} ${sy}`;
     }
 
-    res.json({ trend, months, from, to });
-  })
-);
+    const iv = inv.get(key);
+    const netRevenue = Number(iv?.grossRevenue ?? 0) - Number(ret.get(key)?.retNet ?? 0);
+    const cogs = Number(cog.get(key)?.cogs ?? 0) - Number(ret.get(key)?.retCogs ?? 0);
+    const expenses = Number(exp.get(key)?.expenses ?? 0);
+    const serviceIncome = Number(inc.get(key)?.income ?? 0);
+
+    trend.push({
+      // `month` is the key's original name, kept so the older frontend's
+      // React list keys keep working; it holds the week's Monday in week mode.
+      month: key,
+      key,
+      label,
+      fullLabel,
+      sales: round2(Number(iv?.sales ?? 0)),
+      purchases: round2(Number(iv?.purchases ?? 0)),
+      netRevenue: round2(netRevenue),
+      serviceIncome: round2(serviceIncome),
+      cogs: round2(cogs),
+      expenses: round2(expenses),
+      profit: round2(netRevenue + serviceIncome - cogs - expenses),
+      saleBills: Number(iv?.saleBills ?? 0),
+      purchaseBills: Number(iv?.purchaseBills ?? 0),
+    });
+  }
+
+  res.json({ trend, bucket, periods, from, to });
+});
+
+router.get("/trend", trendHandler);
+router.get("/monthly-trend", trendHandler);
 
 // GET /api/dashboard/recent-invoices
 router.get(
