@@ -399,6 +399,144 @@ router.get(
   })
 );
 
+// GET /api/dashboard/monthly-trend?months=12 — one row per calendar month with
+// sales, purchases and profit, for the dashboard's trend chart. Months are
+// bucketed in Indian time (IST, UTC+5:30) and the window always ends with the
+// current month. Profit is built exactly like /overview's: ex-GST net revenue
+// plus standalone service income, less de-grossed COGS and expenses, with
+// sales returns reversing both the revenue and the cost of the goods sent back.
+router.get(
+  "/monthly-trend",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const IST_MS = 5.5 * 60 * 60 * 1000;
+    const asked = Number(req.query.months);
+    const months = Number.isFinite(asked) ? Math.min(24, Math.max(3, Math.trunc(asked))) : 12;
+
+    const ist = new Date(Date.now() + IST_MS);
+    const y = ist.getUTCFullYear();
+    const m = ist.getUTCMonth();
+    // IST midnight on the 1st of a month, as a UTC instant.
+    const monthStart = (yy: number, mm: number) => new Date(Date.UTC(yy, mm, 1) - IST_MS);
+    const from = monthStart(y, m - (months - 1));
+    const to = monthStart(y, m + 1); // exclusive
+
+    // One grouped query per source instead of a per-month round trip — twelve
+    // months cost five queries, not sixty.
+    const [invoiceRows, cogsRows, expenseRows, incomeRows, returnRows] = await Promise.all([
+      prisma.$queryRaw<
+        Array<{
+          ym: string;
+          sales: number;
+          purchases: number;
+          grossRevenue: number;
+          saleBills: number;
+          purchaseBills: number;
+        }>
+      >(Prisma.sql`
+        SELECT to_char("invoiceDate" + interval '330 minutes', 'YYYY-MM') AS ym,
+               COALESCE(SUM(CASE WHEN type = 'SALE' THEN total END), 0)::float AS sales,
+               COALESCE(SUM(CASE WHEN type = 'PURCHASE' THEN total END), 0)::float AS purchases,
+               COALESCE(SUM(CASE WHEN type = 'SALE' THEN subtotal - discount END), 0)::float
+                 AS "grossRevenue",
+               COUNT(*) FILTER (WHERE type = 'SALE')::int AS "saleBills",
+               COUNT(*) FILTER (WHERE type = 'PURCHASE')::int AS "purchaseBills"
+        FROM "Invoice"
+        WHERE "businessId" = ${businessId}
+          AND "invoiceDate" >= ${from}
+          AND "invoiceDate" < ${to}
+        GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ ym: string; cogs: number }>>(Prisma.sql`
+        SELECT to_char(inv."invoiceDate" + interval '330 minutes', 'YYYY-MM') AS ym,
+               COALESCE(SUM(ii.quantity * i."purchasePrice" / (1 + i."taxRate" / 100)), 0)::float
+                 AS cogs
+        FROM "InvoiceItem" ii
+        JOIN "Invoice" inv ON inv.id = ii."invoiceId"
+        JOIN "Item" i ON i.id = ii."itemId"
+        WHERE inv."businessId" = ${businessId}
+          AND inv.type = 'SALE'
+          AND inv."invoiceDate" >= ${from}
+          AND inv."invoiceDate" < ${to}
+        GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ ym: string; expenses: number }>>(Prisma.sql`
+        SELECT to_char("date" + interval '330 minutes', 'YYYY-MM') AS ym,
+               COALESCE(SUM(amount), 0)::float AS expenses
+        FROM "Expense"
+        WHERE "businessId" = ${businessId}
+          AND "date" >= ${from}
+          AND "date" < ${to}
+        GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ ym: string; income: number }>>(Prisma.sql`
+        SELECT to_char("paymentDate" + interval '330 minutes', 'YYYY-MM') AS ym,
+               COALESCE(SUM(amount), 0)::float AS income
+        FROM "Payment"
+        WHERE "businessId" = ${businessId}
+          AND direction = 'IN'
+          AND purpose IN (${Prisma.join(INCOME_PURPOSE_LIST)})
+          AND "paymentDate" >= ${from}
+          AND "paymentDate" < ${to}
+        GROUP BY 1
+      `),
+      prisma.$queryRaw<Array<{ ym: string; retNet: number; retCogs: number }>>(Prisma.sql`
+        SELECT to_char("date" + interval '330 minutes', 'YYYY-MM') AS ym,
+               COALESCE(SUM("netAmount"), 0)::float AS "retNet",
+               COALESCE(SUM(cogs), 0)::float AS "retCogs"
+        FROM "CreditNote"
+        WHERE "businessId" = ${businessId}
+          AND "date" >= ${from}
+          AND "date" < ${to}
+        GROUP BY 1
+      `),
+    ]);
+
+    const byMonth = <T>(rows: Array<T & { ym: string }>) => new Map(rows.map((r) => [r.ym, r]));
+    const inv = byMonth(invoiceRows);
+    const cog = byMonth(cogsRows);
+    const exp = byMonth(expenseRows);
+    const inc = byMonth(incomeRows);
+    const ret = byMonth(returnRows);
+
+    const MONTH = [
+      "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+      "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+
+    const trend = [];
+    for (let i = months - 1; i >= 0; i--) {
+      const d = new Date(Date.UTC(y, m - i, 1));
+      const yy = d.getUTCFullYear();
+      const mm = d.getUTCMonth();
+      const ym = `${yy}-${String(mm + 1).padStart(2, "0")}`;
+
+      const iv = inv.get(ym);
+      const netRevenue = Number(iv?.grossRevenue ?? 0) - Number(ret.get(ym)?.retNet ?? 0);
+      const cogs = Number(cog.get(ym)?.cogs ?? 0) - Number(ret.get(ym)?.retCogs ?? 0);
+      const expenses = Number(exp.get(ym)?.expenses ?? 0);
+      const serviceIncome = Number(inc.get(ym)?.income ?? 0);
+
+      trend.push({
+        month: ym,
+        label: MONTH[mm],
+        fullLabel: `${MONTH[mm]} ${yy}`,
+        sales: round2(Number(iv?.sales ?? 0)),
+        purchases: round2(Number(iv?.purchases ?? 0)),
+        netRevenue: round2(netRevenue),
+        serviceIncome: round2(serviceIncome),
+        cogs: round2(cogs),
+        expenses: round2(expenses),
+        profit: round2(netRevenue + serviceIncome - cogs - expenses),
+        saleBills: Number(iv?.saleBills ?? 0),
+        purchaseBills: Number(iv?.purchaseBills ?? 0),
+      });
+    }
+
+    res.json({ trend, months, from, to });
+  })
+);
+
 // GET /api/dashboard/recent-invoices
 router.get(
   "/recent-invoices",
