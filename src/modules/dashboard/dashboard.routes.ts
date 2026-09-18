@@ -407,6 +407,14 @@ router.get(
 // de-grossed COGS and expenses, with sales returns reversing both the revenue
 // and the cost of the goods sent back.
 //
+// Stock moved between the owner's shops is reported alongside, as transferIn
+// and transferOut. A transfer carries no money — no bill, no payment — so it
+// is valued at the item's own purchase price (which is stored GST-inclusive,
+// like an invoice total, so the figures are directly comparable). Valuing both
+// directions at cost means one transfer is worth the same on the sending
+// shop's chart as on the receiving shop's. It is deliberately NOT part of
+// sales, purchases or profit: relocating your own stock earns nothing.
+//
 // Also mounted at the older /monthly-trend path so a frontend deployed before
 // weekly existed keeps working (it sends no bucket, and month is the default).
 const trendHandler = asyncHandler(async (req, res) => {
@@ -453,7 +461,8 @@ const trendHandler = asyncHandler(async (req, res) => {
 
   // One grouped query per source instead of a per-period round trip — twelve
   // periods cost five queries, not sixty.
-  const [invoiceRows, cogsRows, expenseRows, incomeRows, returnRows] = await Promise.all([
+  const [invoiceRows, cogsRows, expenseRows, incomeRows, returnRows, transferRows] =
+    await Promise.all([
     prisma.$queryRaw<
       Array<{
         key: string;
@@ -520,6 +529,22 @@ const trendHandler = asyncHandler(async (req, res) => {
         AND "date" < ${to}
       GROUP BY 1
     `),
+    // TRANSFER_OUT is stored as a negative quantity (it reduces stock), so it
+    // is negated here to give a positive value moved.
+    prisma.$queryRaw<Array<{ key: string; transferIn: number; transferOut: number }>>(Prisma.sql`
+      SELECT ${keyOf('sm."createdAt"')} AS key,
+             COALESCE(SUM(CASE WHEN sm.type = 'TRANSFER_IN'
+                               THEN sm.quantity * i."purchasePrice" END), 0)::float AS "transferIn",
+             COALESCE(SUM(CASE WHEN sm.type = 'TRANSFER_OUT'
+                               THEN -sm.quantity * i."purchasePrice" END), 0)::float AS "transferOut"
+      FROM "StockMovement" sm
+      JOIN "Item" i ON i.id = sm."itemId"
+      WHERE sm."businessId" = ${businessId}
+        AND sm.type IN ('TRANSFER_IN', 'TRANSFER_OUT')
+        AND sm."createdAt" >= ${from}
+        AND sm."createdAt" < ${to}
+      GROUP BY 1
+    `),
   ]);
 
   const byKey = <T>(rows: Array<T & { key: string }>) => new Map(rows.map((r) => [r.key, r]));
@@ -528,6 +553,7 @@ const trendHandler = asyncHandler(async (req, res) => {
   const exp = byKey(expenseRows);
   const inc = byKey(incomeRows);
   const ret = byKey(returnRows);
+  const trf = byKey(transferRows);
 
   const MONTH = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
@@ -585,6 +611,8 @@ const trendHandler = asyncHandler(async (req, res) => {
       profit: round2(netRevenue + serviceIncome - cogs - expenses),
       saleBills: Number(iv?.saleBills ?? 0),
       purchaseBills: Number(iv?.purchaseBills ?? 0),
+      transferIn: round2(Number(trf.get(key)?.transferIn ?? 0)),
+      transferOut: round2(Number(trf.get(key)?.transferOut ?? 0)),
     });
   }
 
