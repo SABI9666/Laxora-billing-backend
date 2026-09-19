@@ -6,6 +6,7 @@ import { asyncHandler } from "../../utils/async";
 import { validateBody } from "../../middleware/validate";
 import { badRequest, unauthorized } from "../../utils/errors";
 import { recordStockMovement } from "../../lib/stock";
+import { saveUpload, uploadSingle, type UploadedFile } from "../../lib/storage";
 
 // Online store integration API — used by the Laxorashopping website.
 // Authenticated with a per-shop API key (generated in Settings → Online Store)
@@ -58,6 +59,35 @@ router.get(
         salePrice: Number(i.salePrice),
       })),
     });
+  })
+);
+
+// POST /api/online-store/upload-image — multipart upload of one image from the
+// Laxorashopping admin panel, stored in this project's bucket alongside the
+// billing app's own product photos.
+//
+// The website used to upload to Firebase Storage on its own project. Firebase
+// withdrew Cloud Storage from the no-cost Spark plan, which cut off every
+// image already there and every new one, so the site now uploads here instead
+// — the same bucket the billing software has always used.
+//
+// `folder` keeps the website's own imagery out of the product folder; anything
+// unrecognised falls back to products rather than creating stray folders from
+// whatever the caller sends.
+const WEBSITE_FOLDERS: Record<string, string> = {
+  product: "product-images",
+  category: "website/category-images",
+  event: "website/event-images",
+};
+
+router.post(
+  "/upload-image",
+  uploadSingle("file"),
+  asyncHandler(async (req, res) => {
+    const asked = String(req.query.folder ?? "product");
+    const folder = WEBSITE_FOLDERS[asked] ?? WEBSITE_FOLDERS.product;
+    const file = (req as unknown as { file?: UploadedFile }).file;
+    res.json({ url: await saveUpload(file, req.businessId!, folder) });
   })
 );
 
