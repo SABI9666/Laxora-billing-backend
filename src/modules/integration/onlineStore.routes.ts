@@ -83,6 +83,14 @@ router.get(
           id: i.id,
           name: i.name,
           description: i.description ?? "",
+          // Listing copy the storefront turns into a spec table and a warranty
+          // line. `brand` and `wattage` are ordinary product fields the shop
+          // already fills in, and are the two specs a lighting customer looks
+          // for first, so they are sent as specs in their own right.
+          specification: i.specification ?? "",
+          warranty: i.warranty ?? "",
+          brand: i.brand ?? null,
+          model: i.wattage ?? null,
           sku: i.sku ?? null,
           barcode: i.barcode ?? null,
           price: Number(i.salePrice),

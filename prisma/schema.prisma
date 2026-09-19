@@ -212,6 +212,11 @@ model Item {
   // Online store / website fields — let the shop manage a product's web
   // listing (description + up to three images) right here in billing.
   description   String?
+  // Website listing copy. `specification` holds one "Label: Value" per line
+  // (e.g. "Material: Aluminium\nBeam angle: 120°"), which the storefront
+  // renders as a spec table; free text still shows as a paragraph.
+  specification String?
+  warranty      String? // e.g. "2 years", "6 months manufacturer warranty"
   imageUrl      String?
   imageUrl2     String?
   imageUrl3     String?

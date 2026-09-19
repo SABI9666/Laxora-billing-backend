@@ -15,6 +15,9 @@ const STATEMENTS: string[] = [
   // prisma/expense-settlement.sql (the optional PAID_TO_PARTY backfill is a
   // business decision and stays manual)
   `ALTER TABLE "Expense" ADD COLUMN IF NOT EXISTS "settlement" TEXT`,
+  // prisma/item-website-fields.sql — website listing copy for a product.
+  `ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "specification" TEXT`,
+  `ALTER TABLE "Item" ADD COLUMN IF NOT EXISTS "warranty" TEXT`,
   // prisma/invoice-item-created-at.sql — existing lines must be stamped with
   // their bill's time, otherwise the ledger would show them as added later.
   `ALTER TABLE "InvoiceItem" ADD COLUMN IF NOT EXISTS "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP`,
