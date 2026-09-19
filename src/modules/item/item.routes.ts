@@ -65,6 +65,8 @@ const itemSchema = z.object({
   isService: z.boolean().default(false),
   // Online store / website listing fields.
   description: z.string().optional().nullable(),
+  specification: z.string().optional().nullable(),
+  warranty: z.string().optional().nullable(),
   imageUrl: z.string().optional().nullable(),
   imageUrl2: z.string().optional().nullable(),
   imageUrl3: z.string().optional().nullable(),
