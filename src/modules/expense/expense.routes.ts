@@ -63,10 +63,19 @@ router.post(
       if (!invoice) throw badRequest("Invalid invoiceId for this business");
     }
 
+    // Commission is always given out of money already collected: it never
+    // reduces the bill, it leaves the cash book via cash/bank and comes off
+    // profit. Whatever the client sends, it is stored that way.
+    const isCommission = /commission/i.test(body.category);
     // Reconcile the two fields so the stored row cannot contradict itself.
-    const settlement = body.invoiceId ? body.settlement ?? null : null;
-    const method =
-      settlement === "ADJUST"
+    const settlement = body.invoiceId
+      ? isCommission
+        ? "PAID_TO_PARTY"
+        : body.settlement ?? null
+      : null;
+    const method = isCommission
+      ? body.method ?? "CASH"
+      : settlement === "ADJUST"
         ? null
         : settlement
         ? body.method ?? "CASH"
