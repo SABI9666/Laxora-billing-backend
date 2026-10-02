@@ -756,6 +756,165 @@ const trendHandler = asyncHandler(async (req, res) => {
 router.get("/trend", trendHandler);
 router.get("/monthly-trend", trendHandler);
 
+// GET /api/dashboard/cashflow?bucket=month|week&periods=12 — money that
+// actually moved, per period (IST months, or Monday-start weeks):
+//   collected      received from customers (bill receipts, online orders),
+//                  less refunds paid back to them
+//   toSuppliers    paid to suppliers, less refunds they sent back
+//   commission     commission paid out in cash / bank
+//   expenses       every other expense paid in cash / bank (bill-linked
+//                  charges, rent, salary, expense vouchers, …)
+//   otherIncome    service / other income vouchers
+//   net            collected + otherIncome − toSuppliers − commission − expenses
+// Cash <-> bank transfers are neither in nor out and are left out; charges
+// only adjusted against a bill move no money and are left out too.
+router.get(
+  "/cashflow",
+  asyncHandler(async (req, res) => {
+    const businessId = req.businessId!;
+    const IST_MS = 5.5 * 60 * 60 * 1000;
+    const bucket = req.query.bucket === "week" ? "week" : "month";
+    const asked = Number(req.query.periods);
+    const limits = bucket === "week" ? { min: 4, max: 53, def: 12 } : { min: 3, max: 24, def: 12 };
+    const periods = Number.isFinite(asked)
+      ? Math.min(limits.max, Math.max(limits.min, Math.trunc(asked)))
+      : limits.def;
+
+    const ist = new Date(Date.now() + IST_MS);
+    const y = ist.getUTCFullYear();
+    const m = ist.getUTCMonth();
+    const d = ist.getUTCDate();
+    const weekdayOffset = (ist.getUTCDay() + 6) % 7;
+    const istMidnight = (yy: number, mm: number, dd: number) => new Date(Date.UTC(yy, mm, dd) - IST_MS);
+    const periodStart = (i: number) =>
+      bucket === "week" ? istMidnight(y, m, d - weekdayOffset + i * 7) : istMidnight(y, m + i, 1);
+    const from = periodStart(-(periods - 1));
+    const to = periodStart(1);
+
+    const keyOf = (col: string) => {
+      const c = Prisma.raw(col);
+      return bucket === "week"
+        ? Prisma.sql`to_char(date_trunc('week', ${c} + interval '330 minutes'), 'YYYY-MM-DD')`
+        : Prisma.sql`to_char(${c} + interval '330 minutes', 'YYYY-MM')`;
+    };
+
+    const [payRows, expRows] = await Promise.all([
+      prisma.$queryRaw<
+        Array<{ key: string; direction: string; purpose: string | null; invtype: string | null; amt: number }>
+      >(Prisma.sql`
+        SELECT ${keyOf('p."paymentDate"')} AS key,
+               p.direction::text AS direction, p.purpose, inv.type::text AS invtype,
+               COALESCE(SUM(p.amount), 0)::float AS amt
+        FROM "Payment" p
+        LEFT JOIN "Invoice" inv ON inv.id = p."invoiceId"
+        WHERE p."businessId" = ${businessId}
+          AND p."paymentDate" >= ${from} AND p."paymentDate" < ${to}
+          AND COALESCE(p.purpose, '') NOT IN ('Bank Deposit', 'Bank Withdrawal')
+        GROUP BY 1, 2, 3, 4
+      `),
+      prisma.$queryRaw<Array<{ key: string; commission: boolean; amt: number }>>(Prisma.sql`
+        SELECT ${keyOf('"date"')} AS key,
+               (category ILIKE '%commission%') AS commission,
+               COALESCE(SUM(amount), 0)::float AS amt
+        FROM "Expense"
+        WHERE "businessId" = ${businessId}
+          AND method IS NOT NULL
+          AND COALESCE(settlement, '') <> 'ADJUST'
+          AND "date" >= ${from} AND "date" < ${to}
+        GROUP BY 1, 2
+      `),
+    ]);
+
+    type Row = {
+      received: number;
+      refunds: number;
+      supplierPaid: number;
+      supplierRefunds: number;
+      commission: number;
+      expenses: number;
+      otherIncome: number;
+    };
+    const blank = (): Row => ({
+      received: 0,
+      refunds: 0,
+      supplierPaid: 0,
+      supplierRefunds: 0,
+      commission: 0,
+      expenses: 0,
+      otherIncome: 0,
+    });
+    const rows = new Map<string, Row>();
+    const at = (k: string) => {
+      let r = rows.get(k);
+      if (!r) rows.set(k, (r = blank()));
+      return r;
+    };
+    const income = new Set(INCOME_PURPOSE_LIST);
+    for (const p of payRows) {
+      const r = at(p.key);
+      const amt = Number(p.amt);
+      if (p.direction === "IN") {
+        if (p.purpose && income.has(p.purpose)) r.otherIncome += amt;
+        else if (p.invtype === "PURCHASE") r.supplierRefunds += amt;
+        else r.received += amt;
+      } else {
+        if (p.purpose === "Supplier Payment" || p.invtype === "PURCHASE") r.supplierPaid += amt;
+        else if (p.purpose === "Sales Return Refund" || p.invtype === "SALE") r.refunds += amt;
+        else r.expenses += amt; // expense / other payment vouchers
+      }
+    }
+    for (const x of expRows) {
+      const r = at(x.key);
+      if (x.commission) r.commission += Number(x.amt);
+      else r.expenses += Number(x.amt);
+    }
+
+    const MONTH = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+    const out = [];
+    for (let i = periods - 1; i >= 0; i--) {
+      const startIst = new Date(periodStart(-i).getTime() + IST_MS);
+      const sy = startIst.getUTCFullYear();
+      const sm = startIst.getUTCMonth();
+      const sd = startIst.getUTCDate();
+      let key: string;
+      let label: string;
+      let fullLabel: string;
+      if (bucket === "week") {
+        key = `${sy}-${String(sm + 1).padStart(2, "0")}-${String(sd).padStart(2, "0")}`;
+        label = `${sd} ${MONTH[sm]}`;
+        const end = new Date(Date.UTC(sy, sm, sd + 6));
+        fullLabel =
+          end.getUTCMonth() === sm
+            ? `${sd}–${end.getUTCDate()} ${MONTH[sm]} ${sy}`
+            : `${sd} ${MONTH[sm]} – ${end.getUTCDate()} ${MONTH[end.getUTCMonth()]} ${end.getUTCFullYear()}`;
+      } else {
+        key = `${sy}-${String(sm + 1).padStart(2, "0")}`;
+        label = MONTH[sm];
+        fullLabel = `${MONTH[sm]} ${sy}`;
+      }
+      const r = rows.get(key) ?? blank();
+      const collected = r.received - r.refunds;
+      const toSuppliers = r.supplierPaid - r.supplierRefunds;
+      out.push({
+        key,
+        label,
+        fullLabel,
+        received: round2(r.received),
+        refunds: round2(r.refunds),
+        collected: round2(collected),
+        supplierPaid: round2(r.supplierPaid),
+        supplierRefunds: round2(r.supplierRefunds),
+        toSuppliers: round2(toSuppliers),
+        commission: round2(r.commission),
+        expenses: round2(r.expenses),
+        otherIncome: round2(r.otherIncome),
+        net: round2(collected + r.otherIncome - toSuppliers - r.commission - r.expenses),
+      });
+    }
+    res.json({ cashflow: out, bucket, periods, from, to });
+  })
+);
+
 // GET /api/dashboard/recent-invoices
 router.get(
   "/recent-invoices",
