@@ -9,8 +9,10 @@ import { requireRole, BILLING_ROLES } from "../../middleware/roles";
 import { recordStockMovement } from "../../lib/stock";
 import {
   applyPartyAdvances,
+  billDue,
   recomputeInvoiceSettlement,
   refundedByInvoice,
+  returnedByInvoice,
 } from "../../lib/settlement";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
 
@@ -67,6 +69,9 @@ router.get(
     // discount) minus ex-GST cost of goods (purchase price is GST-inclusive).
     const saleIds = invoices.filter((i) => i.type === "SALE").map((i) => i.id);
     const profitMap = new Map<string, number>();
+    // Profit if the whole bill is collected, and the share collected so far.
+    const profitFullMap = new Map<string, number>();
+    const paidPctMap = new Map<string, number>();
 
     // Value returned against each bill. `amountPaid` only counts money the
     // customer actually paid, so a return (or the return half of an exchange)
@@ -137,16 +142,30 @@ router.get(
           ])
         );
 
+        // Same figures as the customer ledger's profit statement: profit is
+        // earned in proportion to what has been collected on the bill, while
+        // commission and other bill expenses come off in full.
         for (const inv of invoices) {
           if (inv.type !== "SALE") continue;
           const ret = returnMap.get(inv.id) ?? { net: 0, cogs: 0 };
-          const profit =
+          const gross =
             Number(inv.subtotal) -
             Number(inv.discount) -
             ret.net -
-            ((cogsMap.get(inv.id) ?? 0) - ret.cogs) -
-            (expenseMap.get(inv.id) ?? 0);
-          profitMap.set(inv.id, Math.round((profit + Number.EPSILON) * 100) / 100);
+            ((cogsMap.get(inv.id) ?? 0) - ret.cogs);
+          const expenses = expenseMap.get(inv.id) ?? 0;
+          const netValue = round2(Number(inv.total) - (returnedMap.get(inv.id) ?? 0));
+          const due = billDue({
+            total: inv.total,
+            amountPaid: inv.amountPaid,
+            returned: returnedMap.get(inv.id),
+            refunded: saleRefunds.get(inv.id),
+          });
+          const collected = Math.max(0, netValue - Math.max(0, due));
+          const share = netValue > 0.009 ? Math.min(1, collected / netValue) : 1;
+          profitMap.set(inv.id, round2(round2(gross * share) - expenses));
+          profitFullMap.set(inv.id, round2(gross - expenses));
+          paidPctMap.set(inv.id, round2(share * 100));
         }
       } catch (err) {
         console.error("invoice profit calc failed (list still returned):", err);
@@ -157,6 +176,8 @@ router.get(
       invoices: invoices.map((inv) => ({
         ...inv,
         profit: profitMap.get(inv.id) ?? null,
+        profitFull: profitFullMap.get(inv.id) ?? null,
+        paidPercent: paidPctMap.get(inv.id) ?? null,
         returnedAmount: round2(returnedMap.get(inv.id) ?? 0),
         refundedAmount: round2(
           (inv.type === "SALE" ? saleRefunds : purchaseRefunds).get(inv.id) ?? 0
@@ -248,11 +269,46 @@ export async function loadInvoiceDetail(businessId: string, invoiceId: string) {
       .filter((x): x is string => !!x),
   }));
 
+  // The bill's running sum, in the order things happened — the same split
+  // the ledger uses: lines stamped well after the bill was raised, and the
+  // replacement goods of an exchange, were added later.
+  //   original + added − returned = net bill value
+  //   net bill value − paid + refunded = due (negative: owed back)
+  const exchIds = new Set(returns.flatMap((r) => r.exchangeItemIds));
+  const cutoff = invoice.createdAt.getTime() + 10 * 60 * 1000;
+  const added = round2(
+    invoice.items.reduce(
+      (s, it) =>
+        exchIds.has(it.id) || it.createdAt.getTime() > cutoff
+          ? s + Number(it.amount) * (1 + Number(it.taxRate) / 100)
+          : s,
+      0
+    )
+  );
+  const total = round2(Number(invoice.total));
+  const returnedAmount = round2(Number(cn._sum.totalAmount ?? 0));
+  const breakdown = {
+    original: round2(total - added),
+    added,
+    total,
+    returned: returnedAmount,
+    netValue: round2(total - returnedAmount),
+    paid: round2(Number(invoice.amountPaid)),
+    refunded: round2(refunded ?? 0),
+    due: billDue({
+      total,
+      amountPaid: invoice.amountPaid,
+      returned: returnedAmount,
+      refunded: refunded ?? 0,
+    }),
+  };
+
   return {
     ...invoice,
-    returnedAmount: round2(Number(cn._sum.totalAmount ?? 0)),
+    returnedAmount,
     refundedAmount: round2(refunded ?? 0),
     returns,
+    breakdown,
   };
 }
 
@@ -818,7 +874,24 @@ router.post(
       }
     }
 
-    // What actually moves through the cash book for this exchange.
+    // What the customer still owes on this bill before this return. Money
+    // can only be handed back out of what they have paid OVER the bill's new
+    // value: on a bill that is still pending, the return first comes off the
+    // balance and only the excess (if any) is refundable.
+    //   new bill value = total + exchange goods − earlier returns − this return
+    //   refundable     = what was paid − new bill value (never below zero)
+    const [retMap, refMap] = await Promise.all([
+      returnedByInvoice(prisma, businessId, [invoice.id]),
+      refundedByInvoice(prisma, businessId, [invoice.id], "SALE"),
+    ]);
+    const dueBefore = billDue({
+      total: invoice.total,
+      amountPaid: invoice.amountPaid,
+      returned: retMap.get(invoice.id),
+      refunded: refMap.get(invoice.id),
+    });
+
+    // What actually moves through the cash book for this return / exchange.
     let collected = 0;
     let refunded = 0;
     if (exch) {
@@ -828,8 +901,12 @@ router.post(
             ? difference
             : round2(Math.min(Math.max(exch.collectAmount ?? 0, 0), difference));
       } else if (difference < -0.009 && exch.refund !== "ADJUST") {
-        refunded = round2(-difference);
+        const excess = Math.max(0, -(dueBefore + difference));
+        refunded = round2(Math.min(-difference, excess));
       }
+    } else if (body.refundMethod) {
+      const excess = Math.max(0, -(dueBefore - returnGross));
+      refunded = round2(Math.min(returnGross, excess));
     }
 
     const creditNote = await prisma.$transaction(async (tx) => {
@@ -944,7 +1021,7 @@ router.post(
           ? null
           : exch.refund
         : body.refundMethod ?? null;
-      const refundAmount = exch ? refunded : refundMethod ? returnGross : 0;
+      const refundAmount = refundMethod ? refunded : 0;
 
       let refundPaymentId: string | null = null;
       if (refundMethod && refundAmount > 0.009) {
@@ -995,6 +1072,8 @@ router.post(
     res.json({
       creditNote,
       returnedAmount: returnGross,
+      // Cash/bank actually handed back (capped at what was overpaid).
+      refundedAmount: round2(refunded),
       ...(exch
         ? {
             exchange: {
