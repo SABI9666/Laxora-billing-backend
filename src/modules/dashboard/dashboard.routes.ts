@@ -4,6 +4,7 @@ import { prisma } from "../../lib/prisma";
 import { asyncHandler } from "../../utils/async";
 import { INCOME_PURPOSE_LIST } from "../../lib/income";
 import { billDue, refundedByInvoice } from "../../lib/settlement";
+import { collectionEvents, summariseCollections } from "../../lib/collectedProfit";
 
 const router = Router();
 
@@ -152,7 +153,7 @@ router.get(
     const profitFor = async (from: Date, to: Date) => {
       // `to` is exclusive, so a period covers exactly itself.
       const range = { gte: from, lt: to };
-      const [rev, cogsRows, exp, svc, ret] = await Promise.all([
+      const [rev, cogsRows, exp, svc, ret, events] = await Promise.all([
         prisma.invoice.aggregate({
           where: { businessId, type: "SALE", invoiceDate: range },
           _sum: { subtotal: true, discount: true, total: true },
@@ -185,7 +186,9 @@ router.get(
           where: { businessId, date: range },
           _sum: { netAmount: true, cogs: true },
         }),
+        collectionEvents(prisma, businessId, from, to),
       ]);
+      const col = summariseCollections(events);
       const returnsNet = Number(ret._sum.netAmount ?? 0);
       const returnsCogs = Number(ret._sum.cogs ?? 0);
       const netRevenue =
@@ -211,6 +214,11 @@ router.get(
       }
       const expenses = commission + billCharges + shopExpenses;
       const grossProfit = netRevenue - cogs;
+      // Net profit counts only money actually collected in the period: the
+      // profit carried by receipts (less refunds), plus service income, less
+      // every expense paid in the period. Sales billed but not yet paid earn
+      // nothing until they are paid.
+      const profitOnCollections = col.profit;
       return {
         sales: round2(Number(rev._sum.total ?? 0)),
         bills: rev._count,
@@ -227,7 +235,18 @@ router.get(
           .map(([category, amount]) => ({ category, amount: round2(amount) }))
           .sort((a, b) => b.amount - a.amount),
         expenses: round2(expenses),
-        profit: round2(grossProfit + serviceIncome - expenses),
+        // Money settled on sale bills in the period (incl. GST).
+        collected: {
+          received: round2(col.received),
+          refunded: round2(col.refunded),
+          adjusted: round2(col.adjusted),
+          settled: round2(col.settled),
+        },
+        profitOnCollections: round2(profitOnCollections),
+        // For reference: the result if every bill raised in the period were
+        // already paid (accrual basis).
+        billedProfit: round2(grossProfit + serviceIncome - expenses),
+        profit: round2(profitOnCollections + serviceIncome - expenses),
       };
     };
 
@@ -636,6 +655,26 @@ const trendHandler = asyncHandler(async (req, res) => {
     `),
   ]);
 
+  // Profit on money collected, bucketed by the day it came in — the same
+  // keys as the SQL above (IST month, or the IST Monday of the week).
+  const events = await collectionEvents(prisma, businessId, from, to);
+  const jsKey = (dt: Date) => {
+    const t = new Date(dt.getTime() + IST_MS);
+    if (bucket === "month") return t.toISOString().slice(0, 7);
+    const back = (t.getUTCDay() + 6) % 7;
+    return new Date(
+      Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() - back)
+    ).toISOString().slice(0, 10);
+  };
+  const colByKey = new Map<string, { settled: number; profit: number }>();
+  for (const e of events) {
+    const k = jsKey(e.date);
+    const cur = colByKey.get(k) ?? { settled: 0, profit: 0 };
+    cur.settled += e.amount;
+    cur.profit += e.profit;
+    colByKey.set(k, cur);
+  }
+
   const byKey = <T>(rows: Array<T & { key: string }>) => new Map(rows.map((r) => [r.key, r]));
   const inv = byKey(invoiceRows);
   const cog = byKey(cogsRows);
@@ -683,6 +722,7 @@ const trendHandler = asyncHandler(async (req, res) => {
     const cogs = Number(cog.get(key)?.cogs ?? 0) - Number(ret.get(key)?.retCogs ?? 0);
     const expenses = Number(exp.get(key)?.expenses ?? 0);
     const serviceIncome = Number(inc.get(key)?.income ?? 0);
+    const col = colByKey.get(key) ?? { settled: 0, profit: 0 };
 
     trend.push({
       // `month` is the key's original name, kept so the older frontend's
@@ -697,7 +737,12 @@ const trendHandler = asyncHandler(async (req, res) => {
       serviceIncome: round2(serviceIncome),
       cogs: round2(cogs),
       expenses: round2(expenses),
-      profit: round2(netRevenue + serviceIncome - cogs - expenses),
+      // Net profit on money collected in the period (see collectedProfit.ts);
+      // billedProfit is the old accrual figure, for reference.
+      collected: round2(col.settled),
+      profitOnCollections: round2(col.profit),
+      profit: round2(col.profit + serviceIncome - expenses),
+      billedProfit: round2(netRevenue + serviceIncome - cogs - expenses),
       saleBills: Number(iv?.saleBills ?? 0),
       purchaseBills: Number(iv?.purchaseBills ?? 0),
       transferIn: round2(Number(trf.get(key)?.transferIn ?? 0)),
