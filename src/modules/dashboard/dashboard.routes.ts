@@ -168,9 +168,9 @@ router.get(
             AND inv."invoiceDate" >= ${from}
             AND inv."invoiceDate" < ${to}
         `),
-        prisma.expense.aggregate({
+        prisma.expense.findMany({
           where: { businessId, date: range },
-          _sum: { amount: true },
+          select: { amount: true, category: true, invoiceId: true },
         }),
         prisma.payment.aggregate({
           where: {
@@ -191,25 +191,110 @@ router.get(
       const netRevenue =
         Number(rev._sum.subtotal ?? 0) - Number(rev._sum.discount ?? 0) - returnsNet;
       const cogs = Number(cogsRows[0]?.cogs ?? 0) - returnsCogs;
-      const expenses = Number(exp._sum.amount ?? 0);
       const serviceIncome = Number(svc._sum.amount ?? 0);
+
+      // Expenses split the way a P&L reads: commission (paid out of what was
+      // collected), other charges booked against a bill, and the shop's own
+      // running costs (rent, salary, …) that belong to no bill.
+      let commission = 0;
+      let billCharges = 0;
+      let shopExpenses = 0;
+      const shopByCat = new Map<string, number>();
+      for (const x of exp) {
+        const amt = Number(x.amount);
+        if (/commission/i.test(x.category)) commission += amt;
+        else if (x.invoiceId) billCharges += amt;
+        else {
+          shopExpenses += amt;
+          shopByCat.set(x.category, (shopByCat.get(x.category) ?? 0) + amt);
+        }
+      }
+      const expenses = commission + billCharges + shopExpenses;
+      const grossProfit = netRevenue - cogs;
       return {
         sales: round2(Number(rev._sum.total ?? 0)),
         bills: rev._count,
+        grossSales: round2(Number(rev._sum.subtotal ?? 0) - Number(rev._sum.discount ?? 0)),
+        returns: round2(returnsNet),
         netRevenue: round2(netRevenue),
         serviceIncome: round2(serviceIncome),
         cogs: round2(cogs),
+        grossProfit: round2(grossProfit),
+        commission: round2(commission),
+        billCharges: round2(billCharges),
+        shopExpenses: round2(shopExpenses),
+        shopExpensesByCategory: [...shopByCat.entries()]
+          .map(([category, amount]) => ({ category, amount: round2(amount) }))
+          .sort((a, b) => b.amount - a.amount),
         expenses: round2(expenses),
-        profit: round2(netRevenue + serviceIncome - cogs - expenses),
+        profit: round2(grossProfit + serviceIncome - expenses),
       };
     };
 
     const todayEnd = new Date(todayStart.getTime() + 24 * 3600 * 1000);
 
+    // Of the period's profit, the part still sitting in bills that are not
+    // yet collected — the same proportional rule as the invoice list and the
+    // customer ledger (a half-paid bill has earned half its profit).
+    const unrealisedFor = async (from: Date, to: Date) => {
+      const bills = await prisma.invoice.findMany({
+        where: {
+          businessId,
+          type: "SALE",
+          invoiceDate: { gte: from, lt: to },
+          status: { in: ["UNPAID", "PARTIAL"] },
+        },
+        select: { id: true, total: true, amountPaid: true, subtotal: true, discount: true },
+      });
+      if (!bills.length) return { amount: 0, bills: 0 };
+      const ids = bills.map((b) => b.id);
+      const [cogsRows, cnRows, refunds] = await Promise.all([
+        prisma.$queryRaw<Array<{ invoiceid: string; cogs: number }>>(Prisma.sql`
+          SELECT ii."invoiceId" AS invoiceid,
+                 COALESCE(SUM(ii.quantity * i."purchasePrice" / NULLIF(1 + i."taxRate" / 100, 0)), 0)::float AS cogs
+          FROM "InvoiceItem" ii JOIN "Item" i ON i.id = ii."itemId"
+          WHERE ii."invoiceId" IN (${Prisma.join(ids)})
+          GROUP BY 1
+        `),
+        prisma.creditNote.groupBy({
+          by: ["invoiceId"],
+          where: { businessId, invoiceId: { in: ids } },
+          _sum: { netAmount: true, cogs: true, totalAmount: true },
+        }),
+        refundedByInvoice(prisma, businessId, ids, "SALE"),
+      ]);
+      const cogsMap = new Map(cogsRows.map((r) => [r.invoiceid, Number(r.cogs)]));
+      const cnMap = new Map(cnRows.map((r) => [r.invoiceId, r._sum]));
+      let amount = 0;
+      let count = 0;
+      for (const b of bills) {
+        const cn = cnMap.get(b.id);
+        const returned = Number(cn?.totalAmount ?? 0);
+        const gross =
+          Number(b.subtotal) -
+          Number(b.discount) -
+          Number(cn?.netAmount ?? 0) -
+          ((cogsMap.get(b.id) ?? 0) - Number(cn?.cogs ?? 0));
+        const netValue = Number(b.total) - returned;
+        const due = billDue({
+          total: b.total,
+          amountPaid: b.amountPaid,
+          returned,
+          refunded: refunds.get(b.id),
+        });
+        if (netValue <= 0.009 || due <= 0.009) continue;
+        const unpaidShare = Math.min(1, due / netValue);
+        amount += gross * unpaidShare;
+        count++;
+      }
+      return { amount: round2(amount), bills: count };
+    };
+
     const [
       today,
       month,
       prev,
+      unrealised,
       weekSales,
       receivables,
       payables,
@@ -225,6 +310,7 @@ router.get(
       // The period before the selected one, for the "vs last month/quarter/FY"
       // line on the Sales and Profit cards.
       profitFor(prevStart, prevEnd),
+      unrealisedFor(periodStart, periodEnd),
       prisma.invoice.findMany({
         where: { businessId, type: "SALE", invoiceDate: { gte: weekStart } },
         select: { invoiceDate: true, total: true, channel: true },
@@ -383,6 +469,9 @@ router.get(
         // Selected period's figures (kept under `month` for compatibility).
         month,
         prev,
+        // Profit in the selected period's bills that is still waiting on
+        // customer payments; month.profit − this = profit already realised.
+        unrealised,
         period,
         periodStart,
         periodEnd,
