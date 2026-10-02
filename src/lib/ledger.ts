@@ -50,26 +50,53 @@ export type LedgerEntry = {
   credit: number;
 };
 
-// Shop-side profit on one sale bill, after everything that happened on it.
-// Internal only — never sent on a public share link.
-//   sales    ex-GST value billed, less discount and goods returned
-//   cost     purchase cost of the goods that stayed sold
-//   charges  bill-linked charges (commission, transport, …) — the commission
-//            is paid out of the money collected, so it comes off the profit
+// Shop-side profit statement for one sale bill, in the order things happen:
+// the bill and its changes, what was collected, the profit earned on that,
+// the expenses paid out of it (commission first), and what it did to the
+// cash book. Internal only — never sent on a public share link.
+export type LedgerProfitExpense = {
+  date: Date;
+  category: string;
+  note: string | null;
+  amount: number;
+  // "CASH" / "BANK" / … when money left the cash book; null when it was only
+  // adjusted against the bill.
+  method: string | null;
+};
 export type LedgerProfitRow = {
   invoiceId: string;
   invoiceNumber: string;
   date: Date;
+  status: LedgerBill["status"];
+  // Bill side (incl. GST — what the customer pays).
+  original: number;
+  added: number;
+  returned: number;
+  netValue: number;
+  received: number; // settling money (and charges adjusted) less refunds
+  balance: number;
+  paidPercent: number; // share of the net bill value collected, 0–100
+  // Profit side (ex-GST, same basis as Profit & Loss).
   sales: number;
   cost: number;
-  grossProfit: number;
+  grossProfit: number; // on the whole bill
+  earnedProfit: number; // grossProfit × paidPercent — what the money in hand carries
   commission: number;
   otherCharges: number;
-  netProfit: number;
+  expenses: LedgerProfitExpense[];
+  netProfit: number; // earnedProfit − commission − otherCharges (negative = loss)
+  // Cash book effect of this bill.
+  cashIn: number;
+  cashOut: number;
+  netCash: number;
 };
+export type LedgerProfitTotals = Omit<
+  LedgerProfitRow,
+  "invoiceId" | "invoiceNumber" | "date" | "status" | "expenses" | "paidPercent"
+> & { paidPercent: number };
 export type LedgerProfit = {
   bills: LedgerProfitRow[];
-  totals: Omit<LedgerProfitRow, "invoiceId" | "invoiceNumber" | "date">;
+  totals: LedgerProfitTotals;
 };
 
 export type LedgerTotals = {
@@ -660,10 +687,13 @@ export async function buildPartyLedger(
     })
     .sort((a, b) => a.date.getTime() - b.date.getTime());
 
-  // ---- Profit per sale bill (internal). -------------------------------------
+  // ---- Profit statement per sale bill (internal). ---------------------------
   // Same basis as the Profit & Loss report: ex-GST sales less discount, cost
   // of goods at the item's purchase price (stored incl. GST), returns backing
-  // out both sides, and every bill-linked charge as an expense.
+  // out both sides. Profit is only counted as earned in proportion to what has
+  // been collected — a half-paid bill has earned half its profit — while every
+  // expense on the bill (commission, transport, …) is deducted in full, since
+  // that money has already gone out.
   let profit: LedgerProfit | null = null;
   if (invoiceType === "SALE") {
     const retByInv = new Map<string, { net: number; cogs: number }>();
@@ -674,9 +704,13 @@ export async function buildPartyLedger(
       r.cogs += Number(cn.cogs);
       retByInv.set(cn.invoiceId, r);
     }
+    const billById = new Map(bills.map((b) => [b.invoiceId, b]));
     const isCommission = (c: Charge) => /commission/i.test(c.category);
+    const movesCash = (c: Charge) => !!c.method && c.settlement !== "ADJUST";
+
     const rows: LedgerProfitRow[] = invoices
       .map((inv) => {
+        const bill = billById.get(inv.id)!;
         const ret = retByInv.get(inv.id) ?? { net: 0, cogs: 0 };
         const sales = round2(Number(inv.subtotal) - Number(inv.discount) - ret.net);
         const goodsCost = inv.items.reduce((s, it) => {
@@ -685,37 +719,84 @@ export async function buildPartyLedger(
           return s + Number(it.quantity) * unitCost;
         }, 0);
         const cost = round2(goodsCost - ret.cogs);
-        const charges = chargesByInv.get(inv.id) ?? [];
+        const grossProfit = round2(sales - cost);
+
+        const netValue = bill.net;
+        const balance = round2(Math.max(0, bill.due));
+        const collected = round2(Math.max(0, netValue - balance));
+        const share = netValue > 0.009 ? Math.min(1, collected / netValue) : 1;
+        const earnedProfit = round2(grossProfit * share);
+
+        const charges = [...(chargesByInv.get(inv.id) ?? [])].sort(
+          (a, b) => Number(isCommission(b)) - Number(isCommission(a)) || a.date.getTime() - b.date.getTime()
+        );
         const commission = round2(
           charges.filter(isCommission).reduce((s, c) => s + Number(c.amount), 0)
         );
         const otherCharges = round2(
           charges.filter((c) => !isCommission(c)).reduce((s, c) => s + Number(c.amount), 0)
         );
-        const grossProfit = round2(sales - cost);
+        const cashIn = round2(bill.received - bill.refunded);
+        const cashOut = round2(
+          charges.filter(movesCash).reduce((s, c) => s + Number(c.amount), 0)
+        );
         return {
           invoiceId: inv.id,
           invoiceNumber: inv.invoiceNumber,
           date: inv.invoiceDate,
+          status: bill.status,
+          original: bill.original,
+          added: bill.added,
+          returned: bill.returned,
+          netValue,
+          received: collected,
+          balance,
+          paidPercent: round2(share * 100),
           sales,
           cost,
           grossProfit,
+          earnedProfit,
           commission,
           otherCharges,
-          netProfit: round2(grossProfit - commission - otherCharges),
+          expenses: charges.map((c) => ({
+            date: c.date,
+            category: c.category,
+            note: c.note,
+            amount: round2(Number(c.amount)),
+            method: movesCash(c) ? c.method!.toUpperCase() : null,
+          })),
+          netProfit: round2(earnedProfit - commission - otherCharges),
+          cashIn,
+          cashOut,
+          netCash: round2(cashIn - cashOut),
         };
       })
       .sort((a, b) => a.date.getTime() - b.date.getTime());
-    const sum = (k: keyof LedgerProfit["totals"]) => round2(rows.reduce((s, r) => s + r[k], 0));
+
+    type Summed = Exclude<keyof LedgerProfitTotals, "paidPercent">;
+    const sum = (k: Summed) => round2(rows.reduce((s, r) => s + r[k], 0));
+    const netValue = sum("netValue");
+    const received = sum("received");
     profit = {
       bills: rows,
       totals: {
+        original: sum("original"),
+        added: sum("added"),
+        returned: sum("returned"),
+        netValue,
+        received,
+        balance: sum("balance"),
+        paidPercent: netValue > 0.009 ? round2(Math.min(100, (received / netValue) * 100)) : 100,
         sales: sum("sales"),
         cost: sum("cost"),
         grossProfit: sum("grossProfit"),
+        earnedProfit: sum("earnedProfit"),
         commission: sum("commission"),
         otherCharges: sum("otherCharges"),
         netProfit: sum("netProfit"),
+        cashIn: sum("cashIn"),
+        cashOut: sum("cashOut"),
+        netCash: sum("netCash"),
       },
     };
   }
