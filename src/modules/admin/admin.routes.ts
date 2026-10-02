@@ -1891,7 +1891,7 @@ router.get(
     });
     if (!party) throw notFound("Party not found");
 
-    const { ledger, totals, bills, closingBalance } = await buildPartyLedger(prisma, party);
+    const { ledger, totals, bills, profit, closingBalance } = await buildPartyLedger(prisma, party);
 
     res.json({
       party: {
@@ -1908,6 +1908,7 @@ router.get(
       closingBalance,
       totals,
       bills,
+      profit,
       ledger,
     });
   })

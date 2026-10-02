@@ -50,6 +50,55 @@ export type LedgerEntry = {
   credit: number;
 };
 
+// Shop-side profit statement for one sale bill, in the order things happen:
+// the bill and its changes, what was collected, the profit earned on that,
+// the expenses paid out of it (commission first), and what it did to the
+// cash book. Internal only — never sent on a public share link.
+export type LedgerProfitExpense = {
+  date: Date;
+  category: string;
+  note: string | null;
+  amount: number;
+  // "CASH" / "BANK" / … when money left the cash book; null when it was only
+  // adjusted against the bill.
+  method: string | null;
+};
+export type LedgerProfitRow = {
+  invoiceId: string;
+  invoiceNumber: string;
+  date: Date;
+  status: LedgerBill["status"];
+  // Bill side (incl. GST — what the customer pays).
+  original: number;
+  added: number;
+  returned: number;
+  netValue: number;
+  received: number; // settling money (and charges adjusted) less refunds
+  balance: number;
+  paidPercent: number; // share of the net bill value collected, 0–100
+  // Profit side (ex-GST, same basis as Profit & Loss).
+  sales: number;
+  cost: number;
+  grossProfit: number; // on the whole bill
+  earnedProfit: number; // grossProfit × paidPercent — what the money in hand carries
+  commission: number;
+  otherCharges: number;
+  expenses: LedgerProfitExpense[];
+  netProfit: number; // earnedProfit − commission − otherCharges (negative = loss)
+  // Cash book effect of this bill.
+  cashIn: number;
+  cashOut: number;
+  netCash: number;
+};
+export type LedgerProfitTotals = Omit<
+  LedgerProfitRow,
+  "invoiceId" | "invoiceNumber" | "date" | "status" | "expenses" | "paidPercent"
+> & { paidPercent: number };
+export type LedgerProfit = {
+  bills: LedgerProfitRow[];
+  totals: LedgerProfitTotals;
+};
+
 export type LedgerTotals = {
   billed: number;
   received: number;
@@ -71,7 +120,8 @@ export type LedgerTotals = {
 //   Sales Return           goods taken back — reduces what is owed
 //   Return refund          cash handed back on a return — owed again
 //   Exchange: items taken  replacement goods on the same bill
-//   <Charge> …             bill-linked charges: adjusted, allowed/paid, or memo
+//   <Charge> …             bill-linked charges: adjusted, or a memo when paid
+//                          out of collected money (commission) / to others
 export async function buildPartyLedger(
   db: Db,
   party: {
@@ -84,6 +134,8 @@ export async function buildPartyLedger(
   ledger: Array<LedgerEntry & { balance: number }>;
   totals: LedgerTotals;
   bills: LedgerBill[];
+  // Customers only; null for suppliers.
+  profit: LedgerProfit | null;
   closingBalance: number;
 }> {
   const round3 = (n: number) => Math.round((n + Number.EPSILON) * 1000) / 1000;
@@ -100,6 +152,8 @@ export async function buildPartyLedger(
     createdAt: true,
     total: true,
     amountPaid: true,
+    subtotal: true,
+    discount: true,
   } as const;
   const itemSelect = {
     id: true,
@@ -109,7 +163,7 @@ export async function buildPartyLedger(
     rate: true,
     taxRate: true,
     amount: true,
-    item: { select: { unit: true } },
+    item: { select: { unit: true, purchasePrice: true, taxRate: true } },
   } as const;
   type InvoiceRow = Prisma.InvoiceGetPayload<{ select: typeof invoiceSelect }> & {
     items: Array<Prisma.InvoiceItemGetPayload<{ select: typeof itemSelect }> & { createdAt: Date }>;
@@ -159,6 +213,8 @@ export async function buildPartyLedger(
       select: {
         date: true,
         totalAmount: true,
+        netAmount: true,
+        cogs: true,
         invoiceNumber: true,
         invoiceId: true,
         reason: true,
@@ -467,10 +523,9 @@ export async function buildPartyLedger(
   // only the portion that actually cleared the bill: amountPaid is capped at
   // the bill total, so (amountPaid − payments on that bill) is the settling
   // budget, allocated across the bill's charges in date order; any remainder
-  // is the shop's own cost and shown as a memo. Money handed to the party
-  // itself (a commission given to the electrician) is the standard
-  // "allowed / paid" pair — net zero, both visible. Money paid to a third
-  // party is a memo only.
+  // is the shop's own cost and shown as a memo. Money handed out of what was
+  // collected — a commission to the party, or a payment to a third party —
+  // is a memo only: the balance does not move, the profit does.
   const billCharges = invoices.length
     ? await db.expense.findMany({
         where: { businessId, invoiceId: { in: invoices.map((i) => i.id) } },
@@ -544,21 +599,21 @@ export async function buildPartyLedger(
       const amount = Number(c.amount);
       const via = (c.method ?? "CASH").toUpperCase();
       if (c.settlement === "PAID_TO_PARTY") {
+        // Paid out of the money already collected: the bill stays as billed
+        // and received, so the party's balance does not move. It is the
+        // shop's expense and comes off the bill's profit.
         totals.chargesGiven += amount;
-        entries.push({
-          date: c.date,
-          kind: `${name(c)} allowed`,
-          ref: inv.invoiceNumber,
-          note: [c.note, "allowed out of the bill value"].filter(Boolean).join(" · "),
-          debit: 0,
-          credit: amount,
-        });
         entries.push({
           date: c.date,
           kind: `${name(c)} paid (${via})`,
           ref: inv.invoiceNumber,
-          note: `given to party via ${via.toLowerCase()}`,
-          debit: amount,
+          note: [
+            c.note,
+            `${inr(amount)} given via ${via.toLowerCase()} out of the amount collected — shop's expense, deducted from profit; balance unchanged`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
+          debit: 0,
           credit: 0,
         });
       } else {
@@ -632,9 +687,124 @@ export async function buildPartyLedger(
     })
     .sort((a, b) => a.date.getTime() - b.date.getTime());
 
+  // ---- Profit statement per sale bill (internal). ---------------------------
+  // Same basis as the Profit & Loss report: ex-GST sales less discount, cost
+  // of goods at the item's purchase price (stored incl. GST), returns backing
+  // out both sides. Profit is only counted as earned in proportion to what has
+  // been collected — a half-paid bill has earned half its profit — while every
+  // expense on the bill (commission, transport, …) is deducted in full, since
+  // that money has already gone out.
+  let profit: LedgerProfit | null = null;
+  if (invoiceType === "SALE") {
+    const retByInv = new Map<string, { net: number; cogs: number }>();
+    for (const cn of creditNotes) {
+      if (!cn.invoiceId) continue;
+      const r = retByInv.get(cn.invoiceId) ?? { net: 0, cogs: 0 };
+      r.net += Number(cn.netAmount);
+      r.cogs += Number(cn.cogs);
+      retByInv.set(cn.invoiceId, r);
+    }
+    const billById = new Map(bills.map((b) => [b.invoiceId, b]));
+    const isCommission = (c: Charge) => /commission/i.test(c.category);
+    const movesCash = (c: Charge) => !!c.method && c.settlement !== "ADJUST";
+
+    const rows: LedgerProfitRow[] = invoices
+      .map((inv) => {
+        const bill = billById.get(inv.id)!;
+        const ret = retByInv.get(inv.id) ?? { net: 0, cogs: 0 };
+        const sales = round2(Number(inv.subtotal) - Number(inv.discount) - ret.net);
+        const goodsCost = inv.items.reduce((s, it) => {
+          if (!it.item) return s;
+          const unitCost = Number(it.item.purchasePrice) / (1 + Number(it.item.taxRate) / 100);
+          return s + Number(it.quantity) * unitCost;
+        }, 0);
+        const cost = round2(goodsCost - ret.cogs);
+        const grossProfit = round2(sales - cost);
+
+        const netValue = bill.net;
+        const balance = round2(Math.max(0, bill.due));
+        const collected = round2(Math.max(0, netValue - balance));
+        const share = netValue > 0.009 ? Math.min(1, collected / netValue) : 1;
+        const earnedProfit = round2(grossProfit * share);
+
+        const charges = [...(chargesByInv.get(inv.id) ?? [])].sort(
+          (a, b) => Number(isCommission(b)) - Number(isCommission(a)) || a.date.getTime() - b.date.getTime()
+        );
+        const commission = round2(
+          charges.filter(isCommission).reduce((s, c) => s + Number(c.amount), 0)
+        );
+        const otherCharges = round2(
+          charges.filter((c) => !isCommission(c)).reduce((s, c) => s + Number(c.amount), 0)
+        );
+        const cashIn = round2(bill.received - bill.refunded);
+        const cashOut = round2(
+          charges.filter(movesCash).reduce((s, c) => s + Number(c.amount), 0)
+        );
+        return {
+          invoiceId: inv.id,
+          invoiceNumber: inv.invoiceNumber,
+          date: inv.invoiceDate,
+          status: bill.status,
+          original: bill.original,
+          added: bill.added,
+          returned: bill.returned,
+          netValue,
+          received: collected,
+          balance,
+          paidPercent: round2(share * 100),
+          sales,
+          cost,
+          grossProfit,
+          earnedProfit,
+          commission,
+          otherCharges,
+          expenses: charges.map((c) => ({
+            date: c.date,
+            category: c.category,
+            note: c.note,
+            amount: round2(Number(c.amount)),
+            method: movesCash(c) ? c.method!.toUpperCase() : null,
+          })),
+          netProfit: round2(earnedProfit - commission - otherCharges),
+          cashIn,
+          cashOut,
+          netCash: round2(cashIn - cashOut),
+        };
+      })
+      .sort((a, b) => a.date.getTime() - b.date.getTime());
+
+    type Summed = Exclude<keyof LedgerProfitTotals, "paidPercent">;
+    const sum = (k: Summed) => round2(rows.reduce((s, r) => s + r[k], 0));
+    const netValue = sum("netValue");
+    const received = sum("received");
+    profit = {
+      bills: rows,
+      totals: {
+        original: sum("original"),
+        added: sum("added"),
+        returned: sum("returned"),
+        netValue,
+        received,
+        balance: sum("balance"),
+        paidPercent: netValue > 0.009 ? round2(Math.min(100, (received / netValue) * 100)) : 100,
+        sales: sum("sales"),
+        cost: sum("cost"),
+        grossProfit: sum("grossProfit"),
+        earnedProfit: sum("earnedProfit"),
+        commission: sum("commission"),
+        otherCharges: sum("otherCharges"),
+        netProfit: sum("netProfit"),
+        cashIn: sum("cashIn"),
+        cashOut: sum("cashOut"),
+        netCash: sum("netCash"),
+      },
+    };
+  }
+
   return {
     ledger,
     bills,
+    profit,
     totals: {
       billed: round2(totals.billed),
       received: round2(totals.received),
