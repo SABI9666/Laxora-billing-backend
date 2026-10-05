@@ -798,7 +798,7 @@ router.get(
         : Prisma.sql`to_char(${c} + interval '330 minutes', 'YYYY-MM')`;
     };
 
-    const [payRows, expRows] = await Promise.all([
+    const [payRows, expRows, billRows] = await Promise.all([
       prisma.$queryRaw<
         Array<{ key: string; direction: string; purpose: string | null; invtype: string | null; amt: number }>
       >(Prisma.sql`
@@ -812,9 +812,8 @@ router.get(
           AND COALESCE(p.purpose, '') NOT IN ('Bank Deposit', 'Bank Withdrawal')
         GROUP BY 1, 2, 3, 4
       `),
-      prisma.$queryRaw<Array<{ key: string; commission: boolean; amt: number }>>(Prisma.sql`
-        SELECT ${keyOf('"date"')} AS key,
-               (category ILIKE '%commission%') AS commission,
+      prisma.$queryRaw<Array<{ key: string; category: string; amt: number }>>(Prisma.sql`
+        SELECT ${keyOf('"date"')} AS key, category,
                COALESCE(SUM(amount), 0)::float AS amt
         FROM "Expense"
         WHERE "businessId" = ${businessId}
@@ -822,6 +821,20 @@ router.get(
           AND COALESCE(settlement, '') <> 'ADJUST'
           AND "date" >= ${from} AND "date" < ${to}
         GROUP BY 1, 2
+      `),
+      // Revenue generated (bills raised) in each period, for the summary.
+      prisma.$queryRaw<
+        Array<{ key: string; sales: number; saleBills: number; purchases: number; purchaseBills: number }>
+      >(Prisma.sql`
+        SELECT ${keyOf('"invoiceDate"')} AS key,
+               COALESCE(SUM(CASE WHEN type = 'SALE' THEN total END), 0)::float AS sales,
+               COUNT(*) FILTER (WHERE type = 'SALE')::int AS "saleBills",
+               COALESCE(SUM(CASE WHEN type = 'PURCHASE' THEN total END), 0)::float AS purchases,
+               COUNT(*) FILTER (WHERE type = 'PURCHASE')::int AS "purchaseBills"
+        FROM "Invoice"
+        WHERE "businessId" = ${businessId}
+          AND "invoiceDate" >= ${from} AND "invoiceDate" < ${to}
+        GROUP BY 1
       `),
     ]);
 
@@ -833,8 +846,11 @@ router.get(
       commission: number;
       expenses: number;
       otherIncome: number;
+      // Cash/bank expenses by category (commission included), for the summary.
+      byCategory: Map<string, number>;
     };
     const blank = (): Row => ({
+      byCategory: new Map(),
       received: 0,
       refunds: 0,
       supplierPaid: 0,
@@ -860,14 +876,22 @@ router.get(
       } else {
         if (p.purpose === "Supplier Payment" || p.invtype === "PURCHASE") r.supplierPaid += amt;
         else if (p.purpose === "Sales Return Refund" || p.invtype === "SALE") r.refunds += amt;
-        else r.expenses += amt; // expense / other payment vouchers
+        else {
+          // expense / other payment vouchers
+          r.expenses += amt;
+          const cat = p.purpose && p.purpose !== "Other" ? p.purpose : "Other payments";
+          r.byCategory.set(cat, (r.byCategory.get(cat) ?? 0) + amt);
+        }
       }
     }
     for (const x of expRows) {
       const r = at(x.key);
-      if (x.commission) r.commission += Number(x.amt);
-      else r.expenses += Number(x.amt);
+      const amt = Number(x.amt);
+      if (/commission/i.test(x.category)) r.commission += amt;
+      else r.expenses += amt;
+      r.byCategory.set(x.category, (r.byCategory.get(x.category) ?? 0) + amt);
     }
+    const bills = new Map(billRows.map((b) => [b.key, b]));
 
     const MONTH = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
     const out = [];
@@ -909,6 +933,13 @@ router.get(
         expenses: round2(r.expenses),
         otherIncome: round2(r.otherIncome),
         net: round2(collected + r.otherIncome - toSuppliers - r.commission - r.expenses),
+        sales: round2(Number(bills.get(key)?.sales ?? 0)),
+        saleBills: Number(bills.get(key)?.saleBills ?? 0),
+        purchases: round2(Number(bills.get(key)?.purchases ?? 0)),
+        purchaseBills: Number(bills.get(key)?.purchaseBills ?? 0),
+        expenseBreakdown: [...r.byCategory.entries()]
+          .map(([category, amount]) => ({ category, amount: round2(amount) }))
+          .sort((a, b) => b.amount - a.amount),
       });
     }
     res.json({ cashflow: out, bucket, periods, from, to });
