@@ -3,6 +3,7 @@ import { env } from "./config/env";
 import { prisma } from "./lib/prisma";
 import { recomputeAllLinkedInvoiceSettlements, reconcilePayments } from "./lib/settlement";
 import { ensureSchema } from "./lib/schema-guard";
+import { fixFinancialYearSeries } from "./lib/invoiceSeries";
 
 const app = createApp();
 
@@ -13,6 +14,13 @@ const server = app.listen(env.port, "0.0.0.0", async () => {
   // Columns the code relies on that may not have been added to the database
   // by hand yet. Runs first so the backfills below see the full schema.
   await ensureSchema(prisma);
+
+  // Shops whose "26-" bill counter ran past 27999 printed 26-28000 onwards.
+  // Move them to the "26-27" prefix and renumber those bills 26-271000, …
+  // Idempotent — a fixed shop no longer matches.
+  fixFinancialYearSeries(prisma)
+    .then((done) => done.forEach((d) => console.log(`Bill numbering fixed — ${d}`)))
+    .catch((e) => console.error("Bill numbering fix failed:", e));
 
   // Bill-linked charges count toward a bill's settled amount; bills whose
   // charges predate that rule still show the old due/status. Idempotent, so
