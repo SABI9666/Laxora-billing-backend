@@ -15,6 +15,7 @@ import {
   returnedByInvoice,
 } from "../../lib/settlement";
 import { deleteInvoiceWithReversal, reverseReturn } from "../../lib/invoiceOps";
+import { fySplit } from "../../lib/invoiceSeries";
 
 const router = Router();
 
@@ -358,12 +359,27 @@ router.post(
             ? { nextSaleNo: { increment: 1 } }
             : { nextPurchaseNo: { increment: 1 } },
       });
-      const seq = body.type === "SALE" ? biz.nextSaleNo - 1 : biz.nextPurchaseNo - 1;
+      let seq = body.type === "SALE" ? biz.nextSaleNo - 1 : biz.nextPurchaseNo - 1;
+      let salePrefix = biz.saleInvoicePrefix ?? "INV-";
+      // A "26-" prefix whose counter carries the year (27xxx) would roll
+      // from 26-27999 to 26-28000. Move the year into the prefix instead and
+      // keep counting: 26-271000, 26-271001, … (see lib/invoiceSeries.ts).
+      if (body.type === "SALE") {
+        const split = fySplit(biz.saleInvoicePrefix, seq);
+        if (split) {
+          salePrefix = split.prefix;
+          seq = split.seq;
+          await tx.business.update({
+            where: { id: businessId },
+            data: { saleInvoicePrefix: split.prefix, nextSaleNo: split.seq + 1 },
+          });
+        }
+      }
       // Sale invoices use the shop's configurable prefix (default "INV-");
       // purchases always use "PUR-".
       const invoiceNumber =
         body.type === "SALE"
-          ? `${biz.saleInvoicePrefix ?? "INV-"}${String(seq).padStart(4, "0")}`
+          ? `${salePrefix}${String(seq).padStart(4, "0")}`
           : `PUR-${String(seq).padStart(4, "0")}`;
 
       const created = await tx.invoice.create({
